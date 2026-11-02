@@ -6,9 +6,13 @@ WORKDIR /src
 COPY ["bottg.csproj", "./"]
 RUN dotnet restore "bottg.csproj"
 
-# Копируем весь проект и публикуем
+# Копируем весь проект
 COPY . .
-RUN dotnet publish "bottg.csproj" -c Release -o /app/publish /p:UseAppHost=false
+
+# Публикуем и сразу копируем книги в publish
+RUN dotnet publish "bottg.csproj" -c Release -o /app/publish /p:UseAppHost=false && \
+    mkdir -p /app/publish/books && \
+    cp -r /src/books/* /app/publish/books/ 2>/dev/null || true
 
 # Финальный рантайм
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
@@ -18,11 +22,8 @@ WORKDIR /app
 ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080
 
-# Копируем опубликованное приложение
+# Копируем опубликованное приложение вместе с книгами
 COPY --from=build /app/publish .
-
-# Копируем папку с книгами
-COPY --from=build /src/books ./books
 
 # Точка входа
 ENTRYPOINT ["dotnet", "bottg.dll"]
