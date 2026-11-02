@@ -21,5 +21,8 @@ EXPOSE 8080
 # Копируем опубликованное приложение
 COPY --from=build /app/publish .
 
+# Копируем папку с книгами
+COPY --from=build /src/books ./books
+
 # Точка входа
 ENTRYPOINT ["dotnet", "bottg.dll"]
