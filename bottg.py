@@ -103,6 +103,11 @@ MODELS: Dict[str, str] = {
 
 API_BASE = f"https://api.telegram.org/bot{TOKEN}/"
 
+# Cloudflare перед inference-эндпоинтом отдаёт 403 (error code 1010) на
+# дефолтный User-Agent urllib - поэтому подставляем обычный браузерный.
+MODEL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
 SYSTEM_PROMPT = """
 Ты помощник учителя физики, математики и информатики в Беларуси. Ты составляешь подробный план-конспект урока.
 
@@ -929,10 +934,19 @@ def ask_model(user_request: str) -> str:
     log.info(f"Запрос к модели {MODEL} ({family}), длина запроса {len(user_request)} символов")
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data,
-                                 headers={"Authorization": f"Bearer {ZEN_KEY}", "Content-Type": "application/json"})
+                                 headers={"Authorization": f"Bearer {ZEN_KEY}",
+                                          "Content-Type": "application/json",
+                                          "User-Agent": MODEL_UA})
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             resp_text = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            detail = ""
+        log.warning(f"Модель {MODEL} ответила HTTP {e.code}: {detail}")
+        return f"Ошибка модели {MODEL}: HTTP {e.code} {detail}"
     except Exception as e:
         return f"Ошибка модели {MODEL}: {e}"
 
@@ -1001,6 +1015,11 @@ def run_plan(chat_id: int, request: str, only_book: Optional[str] = None,
 
     edit_message(chat_id, status, f"🤖 Генерирую план через {MODEL}, это займёт 1-2 минуты...")
     answer = ask_model(user_request)
+    if answer.startswith("Ошибка модели"):
+        # План не получился - не надо сохранять текст ошибки в документ.
+        log.warning(f"План не сгенерирован: {answer}")
+        edit_message(chat_id, status, f"❌ {answer}")
+        return
 
     try:
         path = Path(tempfile.gettempdir()) / f"plan_{datetime.now():%Y%m%d_%H%M%S%f}.docx"
