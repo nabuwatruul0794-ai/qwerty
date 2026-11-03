@@ -5,6 +5,7 @@ import os
 import sys
 import re
 import json
+import gzip
 import subprocess
 import tempfile
 import threading
@@ -138,6 +139,60 @@ SYSTEM_PROMPT = """
 
 # ---------- Книги ----------
 BOOKS: Dict[str, List[str]] = {}
+# Готовый текстовый индекс (books_index/*.txt.gz) - грузится мгновенно,
+# потому что чтение PDF на free-плане Render занимает десятки минут.
+BOOKS_INDEX: Dict[str, Path] = {}
+_books_lock = threading.Lock()
+
+def load_books_index(index_dir: Path) -> Dict[str, Path]:
+    idx: Dict[str, Path] = {}
+    manifest = index_dir / "manifest.json"
+    names: List[str] = []
+    if manifest.exists():
+        try:
+            names = list(json.loads(manifest.read_text(encoding="utf-8")).keys())
+        except Exception as ex:
+            log.warning(f"Не удалось прочитать manifest.json: {ex}")
+    if not names:
+        names = [p.name[:-len(".txt.gz")] for p in index_dir.glob("*.txt.gz")]
+    for name in names:
+        p = index_dir / f"{name}.txt.gz"
+        if p.exists():
+            idx[name] = p
+    log.info(f"Индекс книг: {len(idx)} шт в {index_dir}")
+    return idx
+
+def get_book(name: str) -> List[str]:
+    """Текст книги из индекса, с кэшем в памяти. Читает только запрошенную книгу."""
+    with _books_lock:
+        if name in BOOKS:
+            return BOOKS[name]
+        path = BOOKS_INDEX.get(name)
+        if not path:
+            return []
+        try:
+            with gzip.open(str(path), "rt", encoding="utf-8") as fh:
+                lines = [ln for ln in fh.read().split("\n") if ln]
+        except Exception as ex:
+            log.error(f"Не удалось прочитать индекс {path.name}: {ex}")
+            lines = []
+        BOOKS[name] = lines
+        log.info(f"Книга загружена из индекса: {name} ({len(lines)} строк)")
+        return lines
+
+def warmup_books() -> None:
+    global BOOKS_INDEX
+    try:
+        index_dir = find_dir_up("books_index", BASE_DIR)
+        if index_dir:
+            BOOKS_INDEX = load_books_index(index_dir)
+        books_dir = find_dir_up("books", BASE_DIR)
+        if books_dir and not BOOKS_INDEX:
+            log.info("Индекс не найден - читаю PDF напрямую (на free-плане это очень медленно)")
+            BOOKS.update(load_books(books_dir))
+            log.info(f"Книг загружено из PDF: {len(BOOKS)}")
+    except Exception as ex:
+        log.error(f"warmup_books: {ex}")
 
 # ---------- Чтение одной книги ----------
 def read_book_one(file: str) -> Optional[Dict]:
@@ -209,17 +264,17 @@ def find_paragraph(request: str) -> Tuple[Optional[str], Optional[str]]:
         elif re.search(r"(?<![а-яёa-zA-Z])(?:планиметр|стереометр|вектор|треугольник|окружност)", request, I): subject = "geometriya"
         elif re.search(r"(?<![а-яёa-zA-Z])(?:программ|алгоритм|паскаль|питон|python|компьютер)", request, I): subject = "informatika"
 
-    candidates = list(BOOKS.items())
+    candidate_names = list(BOOKS_INDEX.keys()) if BOOKS_INDEX else list(BOOKS.keys())
     if subject:
-        f = [(k, v) for k, v in candidates if subject in k.lower()]
+        f = [k for k in candidate_names if subject in k.lower()]
         if explicit_subject or f:
-            candidates = f
+            candidate_names = f
     if grade:
         gr = re.compile(rf"-{grade}(?!\d)")
-        f = [(k, v) for k, v in candidates if gr.search(k)]
+        f = [k for k in candidate_names if gr.search(k)]
         if explicit_subject or f:
-            candidates = f
-    if not candidates:
+            candidate_names = f
+    if not candidate_names:
         log.debug("find_paragraph: подходящих книг не найдено")
         return (None, None)
 
@@ -250,7 +305,10 @@ def find_paragraph(request: str) -> Tuple[Optional[str], Optional[str]]:
     best_book: Optional[str] = None
     best_score = 0
 
-    for book_name, lines in candidates:
+    for book_name in candidate_names:
+        lines = get_book(book_name)
+        if not lines:
+            continue
         starts = [idx for idx, line in enumerate(lines) if re.match(r"^§\s*\d+", line)]
         for k in range(len(starts)):
             end = starts[k + 1] if k + 1 < len(starts) else min(len(lines), starts[k] + 600)
@@ -546,10 +604,8 @@ if __name__ == "__main__":
             print(json.dumps(r, ensure_ascii=False))
         sys.exit(0)
 
-    books_dir = find_dir_up("books", BASE_DIR)
-    if books_dir:
-        BOOKS.update(load_books(books_dir))
-    log.info(f"Книг загружено: {len(BOOKS)}. Модель: {MODEL}")
+    threading.Thread(target=warmup_books, daemon=True).start()
+    log.info(f"Сервер стартует сразу, книги грузятся в фоне. Модель: {MODEL}")
 
     try:
         webhook_url = f"{PUBLIC_URL}/webhook"
