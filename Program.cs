@@ -142,7 +142,7 @@ const string SystemPrompt = """
 // ---------- Книги ----------
 var books = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
-async Task<Dictionary<string, List<string>>> LoadBooks()
+Dictionary<string, List<string>> LoadBooks()
 {
     var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
     var dir = FindBooksDir();
@@ -151,7 +151,7 @@ async Task<Dictionary<string, List<string>>> LoadBooks()
         Console.WriteLine("Папка books не найдена.");
         return result;
     }
-var tasks = Directory.GetFiles(dir, "*.pdf").Select(file => Task.Run(() =>
+    foreach (var file in Directory.GetFiles(dir, "*.pdf"))
     {
         try
         {
@@ -167,18 +167,13 @@ var tasks = Directory.GetFiles(dir, "*.pdf").Select(file => Task.Run(() =>
                 }
             }
             var name = Path.GetFileNameWithoutExtension(file);
+            result[name] = lines;
             Console.WriteLine($"Загружена книга: {Path.GetFileName(file)} ({lines.Count} строк)");
-            return (name, lines);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Не удалось прочитать {Path.GetFileName(file)}: {ex.Message}");
-            return (null, (List<string>)null);
         }
-    }));
-    foreach (var t in await Task.WhenAll(tasks))
-    {
-        if (t.name != null) result[t.name] = t.lines;
     }
     return result;
 }
@@ -534,7 +529,7 @@ async Task HandleUpdate(JsonElement update)
 }
 
 // ---------- Запуск веб-сервера ----------
-foreach (var kv in await LoadBooks()) books[kv.Key] = kv.Value;
+foreach (var kv in LoadBooks()) books[kv.Key] = kv.Value;
 Console.WriteLine($"Книг загружено: {books.Count}. Модель: {model}");
 
 var builder = WebApplication.CreateBuilder(args);
