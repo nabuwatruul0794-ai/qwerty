@@ -83,7 +83,7 @@ var allowedUsers = new HashSet<long>
 
 // Http клиенты
 var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
-var llm = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+var llm = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
 string apiBase = $"https://api.telegram.org/bot{token}/";
 
 // Модели
@@ -142,7 +142,7 @@ const string SystemPrompt = """
 // ---------- Книги ----------
 var books = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
-Dictionary<string, List<string>> LoadBooks()
+async Task<Dictionary<string, List<string>>> LoadBooks()
 {
     var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
     var dir = FindBooksDir();
@@ -151,7 +151,7 @@ Dictionary<string, List<string>> LoadBooks()
         Console.WriteLine("Папка books не найдена.");
         return result;
     }
-    foreach (var file in Directory.GetFiles(dir, "*.pdf"))
+var tasks = Directory.GetFiles(dir, "*.pdf").Select(file => Task.Run(() =>
     {
         try
         {
@@ -167,13 +167,18 @@ Dictionary<string, List<string>> LoadBooks()
                 }
             }
             var name = Path.GetFileNameWithoutExtension(file);
-            result[name] = lines;
             Console.WriteLine($"Загружена книга: {Path.GetFileName(file)} ({lines.Count} строк)");
+            return (name, lines);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Не удалось прочитать {Path.GetFileName(file)}: {ex.Message}");
+            return (null, (List<string>)null);
         }
+    }));
+    foreach (var t in await Task.WhenAll(tasks))
+    {
+        if (t.name != null) result[t.name] = t.lines;
     }
     return result;
 }
@@ -383,9 +388,9 @@ async Task<string> AskModel(string userRequest)
     object body;
     switch (family)
     {
-        case "anthropic":
+case "anthropic":
             url = "https://opencode.ai/inference/anthropic/v1/messages";
-            body = new { model, max_tokens = 8000, system = SystemPrompt, messages = new[] { new { role = "user", content = userRequest } } };
+            body = new { model, max_tokens = 32000, system = SystemPrompt, messages = new[] { new { role = "user", content = userRequest } } };
             break;
         case "responses":
             url = "https://opencode.ai/inference/openai/v1/responses";
@@ -430,6 +435,18 @@ async Task<string> AskModel(string userRequest)
         var message = root.GetProperty("choices")[0].GetProperty("message");
         if (message.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.String)
             result.Append(content.GetString());
+    }
+
+    string? stop = family switch
+    {
+        "anthropic" => root.TryGetProperty("stop_reason", out var sr) ? sr.GetString() : null,
+        "responses" => root.TryGetProperty("status", out var st) ? st.GetString() : null,
+        _ => root.GetProperty("choices")[0].TryGetProperty("finish_reason", out var fr) ? fr.GetString() : null
+    };
+    if (stop is "max_tokens" or "incomplete" or "length")
+    {
+        Console.WriteLine($"Ответ обрезан по лимиту токенов ({model}). stop_reason={stop}");
+        result.Append("\n\n[Конспект обрезан по лимиту длины. Попробуйте запросить его снова или переключите модель.]");
     }
 
     return result.ToString();
@@ -517,7 +534,7 @@ async Task HandleUpdate(JsonElement update)
 }
 
 // ---------- Запуск веб-сервера ----------
-foreach (var kv in LoadBooks()) books[kv.Key] = kv.Value;
+foreach (var kv in await LoadBooks()) books[kv.Key] = kv.Value;
 Console.WriteLine($"Книг загружено: {books.Count}. Модель: {model}");
 
 var builder = WebApplication.CreateBuilder(args);
