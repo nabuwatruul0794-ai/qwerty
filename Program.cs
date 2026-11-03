@@ -169,6 +169,8 @@ Dictionary<string, List<string>> LoadBooks()
             var name = Path.GetFileNameWithoutExtension(file);
             result[name] = lines;
             Console.WriteLine($"Загружена книга: {Path.GetFileName(file)} ({lines.Count} строк)");
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
         }
         catch (Exception ex)
         {
