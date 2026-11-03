@@ -234,6 +234,254 @@ def get_book(name: str) -> List[str]:
         log.info(f"Книга загружена из индекса: {name} ({len(lines)} строк)")
         return lines
 
+
+# ---------- Разбор структуры книги: параграфы ----------
+# Заголовок параграфа в учебниках выглядит по-разному:
+#   "§ 12. Название"      - номер в начале
+#   "Название§ 12."       - номер в конце (так вытягивает pypdf)
+#   "12§ 12. Название"    - бегущий колонтитул с номером страницы
+#   "§ 1 2."              - номер с разрывом внутри цифр
+# Плюс блок "СОДЕРЖАНИЕ" с теми же номерами - его надо отличать от тела.
+_SEC_RE = re.compile(r"§\s*(\d(?:\s*\d)*)\s*\.?", re.UNICODE)
+_BAD_TITLE = re.compile(r"[()«»\"]|см\.")
+_PREP_END = re.compile(
+    r"(?:^|\s)(в|из|по|к|и|на|с|о|об|от|до|при|кроме|см|после|про|для|над|под|между)\s*$",
+    re.IGNORECASE)
+_LETTERS3 = re.compile(r"[A-Za-zА-Яа-яЁё]{3,}")
+_DOT_LEADER = re.compile(r"(?:\.\s*){3,}")   # выноски в содержании: ". . ." или "...."
+_PLAIN_RE = re.compile(r"^(\d{1,2})\s*\.?\s+(.*)$")
+_PLAIN_EMPTY_RE = re.compile(r"^(\d{1,2})\s*\.\s*$")
+_TOC_GAP = 20          # строк между соседними пунктами содержания
+_MIN_TOC_RUN = 3       # столько плотных пунктов подряд - уже содержание
+_MAX_HEADING_WORDS = 9
+
+
+def _norm_ws(text: str) -> str:
+    """Пробелы, в том числе неразрывные и narrow, приводим к обычным."""
+    return re.sub(r"[\s\u00a0\u2009]+", " ", text).strip()
+
+
+def _clean_title(text: str) -> str:
+    text = re.sub(r"[\s.·]{2,}\s*\d{1,4}\s*$", "", text)
+    return _norm_ws(text).strip(" .·")
+
+
+def _number_ahead(lines: List[str], i: int) -> Tuple[Optional[int], int]:
+    """Номер может быть разбит на две строки: '1' + '2.' -> 12."""
+    parts: List[str] = []
+    j = i
+    while j < len(lines) and j < i + 3 and len("".join(parts)) < 3:
+        m = re.match(r"^(\d{1,3})(\..*)?$", lines[j].strip())
+        if not m:
+            break
+        parts.append(m.group(1))
+        if m.group(2):
+            break
+        j += 1
+    digits = "".join(parts)
+    return (int(digits) if digits.isdigit() else None), j
+
+
+def _scan_headings(lines: List[str]) -> List[List[object]]:
+    """Строки, похожие на заголовок параграфа: [номер, индекс строки, название]."""
+    out: List[List[object]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if "\u00a7" not in line:
+            i += 1
+            continue
+        m = _SEC_RE.search(line)
+        if m:
+            digits = re.sub(r"\s+", "", m.group(1))
+            if digits.isdigit() and len(digits) <= 3:
+                before = line[:m.start()].strip()
+                after = line[m.end():].strip()
+                title = ""
+                keep = True
+                if before:
+                    if before.isdigit():
+                        title = after                      # колонтитул: страница перед §
+                    elif _BAD_TITLE.search(before) or _PREP_END.search(before):
+                        keep = False                        # перекрёстная ссылка
+                    elif not _LETTERS3.search(before) or len(before.split()) > _MAX_HEADING_WORDS:
+                        keep = False                        # это не заголовок
+                    else:
+                        title = before                       # название перед номером
+                        if title and title[0].islower() and i > 0:
+                            # название началось на предыдущей строке
+                            prev = _norm_ws(lines[i - 1])
+                            if prev and len(prev) < 80 and not prev[0].isdigit() \
+                                    and prev[-1] not in ",.;:":
+                                title = f"{prev} {title}"
+                else:
+                    title = after                           # "§ N. Название"
+                    if after.startswith((",", ")", "]")) or "(см." in line:
+                        keep = False
+                if keep:
+                    out.append([int(digits), i, _clean_title(title)])
+                i += 1
+                continue
+        if re.search(r"§\s*$", line):
+            title = line[:line.rfind("§")].strip()
+            num, j = _number_ahead(lines, i + 1)
+            if num is not None and not _BAD_TITLE.search(title) \
+                    and not _PREP_END.search(title) and _LETTERS3.search(title):
+                out.append([num, j, _clean_title(title)])
+                i = j + 1
+                continue
+        i += 1
+    return out
+
+
+def _dot_leader_regions(lines: List[str], gap: int = 40, min_lines: int = 3) -> List[Tuple[int, int]]:
+    """Границы блока содержания по точечным выноскам '.... 85'."""
+    hits = [i for i, l in enumerate(lines) if _DOT_LEADER.search(_norm_ws(l))]
+    regions: List[Tuple[int, int]] = []
+    if not hits:
+        return regions
+    start = prev = hits[0]
+    count = 1
+    for i in hits[1:]:
+        if i - prev <= gap:
+            prev = i
+            count += 1
+        else:
+            if count >= min_lines:
+                regions.append((start, prev))
+            start = prev = i
+            count = 1
+    if count >= min_lines:
+        regions.append((start, prev))
+    return regions
+
+
+def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
+    """Список параграфов книги с их границами в тексте."""
+    occ = _scan_headings(lines)
+    if not occ:
+        return []
+    gaps = [int(occ[k + 1][1]) - int(occ[k][1]) for k in range(len(occ) - 1)]
+
+    # Блок содержания: плотная кучка заголовков либо заголовок с точечными выносками.
+    toc_flag = [False] * len(occ)
+    regions: List[Tuple[int, int]] = []
+    k = 0
+    while k < len(occ):
+        j = k
+        while j + 1 < len(occ) and gaps[j] < _TOC_GAP:
+            j += 1
+        if j - k + 1 >= _MIN_TOC_RUN:
+            for t in range(k, j + 1):
+                toc_flag[t] = True
+            regions.append((int(occ[k][1]), int(occ[j][1])))
+        k = j + 1
+    regions.extend(_dot_leader_regions(lines))
+    for t, o in enumerate(occ):
+        if not toc_flag[t]:
+            idx = int(o[1])
+            # заголовок может стоять чуть выше первого выноски
+            if any(a - 20 <= idx <= b for a, b in regions):
+                toc_flag[t] = True
+
+    def in_toc(idx: int) -> bool:
+        return any(a <= idx <= b for a, b in regions)
+
+    paras: Dict[int, Dict[str, object]] = {}
+    for t, o in enumerate(occ):
+        if toc_flag[t]:
+            continue
+        num, idx, title = int(o[0]), int(o[1]), str(o[2])
+        if num not in paras:
+            paras[num] = {"num": num, "start": idx, "title": title}
+
+    # Названия из содержания - запасной источник.
+    toc_titles: Dict[int, str] = {}
+    for o in occ:
+        if o[2] and int(o[0]) not in toc_titles:
+            toc_titles[int(o[0])] = str(o[2])
+    max_sec = max([int(o[0]) for o in occ] + [0])
+
+    # Номера, записанные без знака § ("19. Почему") - ищем только внутри содержания.
+    plain_in_toc: Dict[int, str] = {}
+    for a, b in regions:
+        for i in range(a, b + 1):
+            s = _norm_ws(lines[i])
+            m = _PLAIN_EMPTY_RE.match(s) or _PLAIN_RE.match(s)
+            if m:
+                num = int(m.group(1))
+                if 1 <= num <= max_sec:
+                    plain_in_toc.setdefault(num, s)
+    first_body = min((int(p["start"]) for p in paras.values()), default=0)
+    for i, l in enumerate(lines):
+        if _norm_ws(l).lower() in ("содержание", "оглавление"):
+            if i < first_body:
+                for j in range(i, first_body):
+                    s = _norm_ws(lines[j])
+                    m = _PLAIN_EMPTY_RE.match(s) or _PLAIN_RE.match(s)
+                    if m:
+                        num = int(m.group(1))
+                        if 1 <= num <= max_sec:
+                            plain_in_toc.setdefault(num, s)
+            break
+
+    known = set(paras) | set(toc_titles) | set(plain_in_toc)
+    known = {x for x in known if 1 <= x <= max_sec}
+    for num in sorted(known - set(paras)):
+        title = toc_titles.get(num, "")
+        key = " ".join(_norm_ws(title).lower().split()[:3])[:24]
+        if not key and num in plain_in_toc:
+            key = " ".join(plain_in_toc[num].lower().split()[:3])[:24]
+        for i in range(len(lines)):
+            if in_toc(i):
+                continue
+            s = _norm_ws(lines[i])
+            m = _PLAIN_EMPTY_RE.match(s)
+            if m and int(m.group(1)) == num:
+                paras[num] = {"num": num, "start": i, "title": title}
+                break
+            m = _PLAIN_RE.match(s)
+            if m and int(m.group(1)) == num:
+                rest = m.group(2)
+                if key and key in s.lower():
+                    paras[num] = {"num": num, "start": i, "title": title or rest}
+                    break
+
+    starts = sorted(paras.values(), key=lambda p: int(p["start"]))
+    for i, p in enumerate(starts):
+        end = len(lines)
+        for q in starts[i + 1:]:
+            if int(q["num"]) != int(p["num"]):
+                end = int(q["start"])
+                break
+        p["end"] = end
+        p["text"] = "\n".join(lines[int(p["start"]):end])
+    return starts
+
+
+_BOOK_PARAS: Dict[str, List[Dict[str, object]]] = {}
+
+
+def book_paragraphs(name: str) -> List[Dict[str, object]]:
+    """Параграфы книги: [{num, title, start, end, text}, ...]."""
+    with _books_lock:
+        cached = _BOOK_PARAS.get(name)
+    if cached is not None:
+        return cached
+    result = _parse_paragraphs(get_book(name))
+    with _books_lock:
+        _BOOK_PARAS[name] = result
+    log.info(f"Параграфов в «{name}»: {len(result)}")
+    return result
+
+
+def paragraph_text(name: str, num: int) -> str:
+    for p in book_paragraphs(name):
+        if int(p["num"]) == num:
+            return str(p["text"])
+    return ""
+
 def warmup_books() -> None:
     global BOOKS_INDEX, BOOKS_META
     try:
@@ -343,7 +591,7 @@ def find_paragraph(request: str, only_book: Optional[str] = None) -> Tuple[Optio
     else:
         im = re.search(r"(?<!\d)\d{1,3}(?!\d)", no_grade)
         if im:
-            num = int(im.group(1))
+            num = int(im.group(0))
 
     ignore_stems = {"физик", "инфор", "алгеб", "геоме", "матем", "параг", "урок", "конс", "класс", "соста", "сдела", "план", "тема", "теме", "пожал", "нужен", "нужна"}
     stems: List[str] = []
@@ -364,34 +612,19 @@ def find_paragraph(request: str, only_book: Optional[str] = None) -> Tuple[Optio
     best_score = 0
 
     for book_name in candidate_names:
-        lines = get_book(book_name)
-        if not lines:
-            continue
-        starts = [idx for idx, line in enumerate(lines) if re.match(r"^§\s*\d+", line)]
-        for k in range(len(starts)):
-            end = starts[k + 1] if k + 1 < len(starts) else min(len(lines), starts[k] + 600)
+        for p in book_paragraphs(book_name):
+            pnum = int(p["num"])
             if num != -1:
-                head = re.match(r"^§\s*(\d+)", lines[starts[k]])
-                hit = bool(head and int(head.group(1)) == num)
+                hit = pnum == num
                 score = 0
             else:
-                title = lines[starts[k]]
-                if starts[k] + 1 < end:
-                    title += " " + lines[starts[k] + 1]
-                title = title.lower()
+                title = (str(p["title"]) + " " + book_label(book_name)).lower()
                 score = sum(1 for s in stems if s in title)
                 need = 1 if len(stems) == 1 else max(2, int(math.ceil(len(stems) * 0.6)))
                 hit = score >= need
             if not hit:
                 continue
-            sb: List[str] = []
-            cur_len = 0
-            for j in range(starts[k], end):
-                if cur_len + len(lines[j]) + 1 > MAX_CHARS:
-                    break
-                sb.append(lines[j])
-                cur_len += len(lines[j]) + 1
-            text_res = "\n".join(sb).strip()
+            text_res = str(p["text"])[:MAX_CHARS].strip()
             better = (best_text is None or
                       (num != -1 and len(text_res) > len(best_text)) or
                       (score > best_score or (score == best_score and len(text_res) > len(best_text))))
@@ -465,6 +698,13 @@ def tg_post(method: str, data: dict, files: Optional[dict] = None) -> Optional[d
         except Exception:
             return {"ok": True}
         return parsed if isinstance(parsed, dict) else {"ok": True}
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:400]
+        except Exception:
+            body = ""
+        log.warning(f"Telegram {method} error: HTTP {e.code} {body}")
+        return None
     except Exception as e:
         log.warning(f"Telegram {method} error: {e}")
         return None
@@ -527,16 +767,78 @@ def answer_cb(callback_id: str, text: str = "") -> bool:
     return bool(resp and resp.get("ok"))
 
 
+_BOOK_ORDER: List[str] = []
+
+
+def book_order() -> List[str]:
+    """Книги в стабильном порядке - индекс книги нужен для callback_data."""
+    global _BOOK_ORDER
+    if not _BOOK_ORDER:
+        names = list(BOOKS_INDEX.keys()) if BOOKS_INDEX else list(BOOKS.keys())
+        names.sort(key=lambda n: (subject_rank(n), grade_of(n), n))
+        _BOOK_ORDER = names
+    return _BOOK_ORDER
+
+
+def book_by_index(idx: int) -> Optional[str]:
+    names = book_order()
+    return names[idx] if 0 <= idx < len(names) else None
+
+
 def books_keyboard() -> Optional[dict]:
     """Инлайн-кнопки выбора книги, сгруппированные по предмету."""
-    names = list(BOOKS_INDEX.keys()) if BOOKS_INDEX else list(BOOKS.keys())
+    names = book_order()
     if not names:
         return None
-    names.sort(key=lambda n: (subject_rank(n), grade_of(n), n))
-    buttons = [{"text": book_short_label(n), "callback_data": f"bk:{n}"} for n in names]
+    buttons = [{"text": book_short_label(n), "callback_data": f"bk:{i}"} for i, n in enumerate(names)]
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     rows.append([{"text": "✖️ Отмена", "callback_data": "bkx"}])
     return {"inline_keyboard": rows}
+
+
+PARAS_PER_PAGE = 12
+
+
+def paragraph_keyboard(book_name: str, page: int = 0) -> Optional[dict]:
+    """Кнопки выбора параграфа внутри книги, постранично."""
+    paras = book_paragraphs(book_name)
+    if not paras:
+        return None
+    pages = max(1, (len(paras) + PARAS_PER_PAGE - 1) // PARAS_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = paras[page * PARAS_PER_PAGE:(page + 1) * PARAS_PER_PAGE]
+    try:
+        bidx = book_order().index(book_name)
+    except ValueError:
+        return None
+    buttons = []
+    for p in chunk:
+        label = f"§ {p['num']}"
+        title = str(p.get("title") or "")
+        if title:
+            label += f" {title[:20]}"
+        buttons.append({"text": label, "callback_data": f"p:{bidx}:{p['num']}"})
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    nav: List[Dict[str, str]] = []
+    if page > 0:
+        nav.append({"text": "◀️", "callback_data": f"pg:{bidx}:{page - 1}"})
+    if page < pages - 1:
+        nav.append({"text": "▶️", "callback_data": f"pg:{bidx}:{page + 1}"})
+    nav.append({"text": "✖️ Отмена", "callback_data": "bkx"})
+    rows.append(nav)
+    return {"inline_keyboard": rows}
+
+
+def book_toc_text(book_name: str) -> str:
+    """Содержание книги текстом - чтобы видеть названия параграфов."""
+    paras = book_paragraphs(book_name)
+    lines = [f"📘 {book_label(book_name)} — параграфы:", ""]
+    for p in paras:
+        title = str(p.get("title") or "")
+        lines.append(f"§ {p['num']}" + (f". {title}" if title else ""))
+    lines.append("")
+    lines.append("Выбери параграф кнопкой ниже.")
+    return "\n".join(lines)
 
 
 # ---------- Состояние выбора книги ----------
@@ -672,8 +974,47 @@ def ask_model(user_request: str) -> str:
     return "".join(result)
 
 # ---------- Обработка обновления ----------
+def run_plan(chat_id: int, request: str, only_book: Optional[str] = None,
+             para_num: Optional[int] = None, status: Optional[int] = None) -> None:
+    """Главный сценарий: найти параграф, собрать план, отправить документ."""
+    if status is None:
+        status = send(chat_id, "🔍 Ищу параграф в учебниках...")
+
+    paragraph = ""
+    book_name = only_book
+    if para_num is not None and only_book:
+        paragraph = paragraph_text(only_book, para_num)
+    else:
+        paragraph, book_name = find_paragraph(request, only_book=only_book)
+
+    user_request = request
+    if paragraph:
+        user_request += "\n\nТекст параграфа из учебника (строй план на нём):\n" + paragraph
+        where = book_label(book_name) if book_name else "учебнике"
+        edit_message(chat_id, status, f"📖 Нашёл параграф в «{where}» ({len(paragraph)} символов)")
+    else:
+        edit_message(chat_id, status, "📖 Параграф в книгах не нашёл — составлю план без текста учебника.")
+
+    edit_message(chat_id, status, f"🤖 Генерирую план через {MODEL}, это займёт 1-2 минуты...")
+    answer = ask_model(user_request)
+
+    try:
+        path = Path(tempfile.gettempdir()) / f"plan_{datetime.now():%Y%m%d_%H%M%S%f}.docx"
+        make_docx(answer, str(path))
+        send_doc(chat_id, str(path), "План-конспект урока")
+        edit_message(chat_id, status, "✅ Готово! План-конспект — в документе ниже.")
+        try:
+            path.unlink()
+        except Exception:
+            pass
+    except Exception as doc_ex:
+        log.warning("DOCX error: " + str(doc_ex))
+        send(chat_id, answer)
+        edit_message(chat_id, status, "✅ Готово! Ниже — план текстом.")
+
+
 def handle_callback_query(cb: dict) -> None:
-    """Обработка нажатия на инлайн-кнопку (выбор книги)."""
+    """Обработка нажатия на инлайн-кнопку (выбор книги или параграфа)."""
     try:
         from_id = cb["from"]["id"]
         if from_id not in ALLOWED_USERS:
@@ -687,22 +1028,53 @@ def handle_callback_query(cb: dict) -> None:
             return
 
         if data.startswith("bk:"):
-            name = data[3:]
-            if name not in BOOKS_INDEX and name not in BOOKS:
+            try:
+                idx = int(data[3:])
+            except ValueError:
+                idx = -1
+            name = book_by_index(idx)
+            if not name:
                 answer_cb(cb_id, "Книга не найдена")
                 return
             state_set(chat_id, name)
-            label = book_label(name)
-            answer_cb(cb_id, f"Выбрана: {label}")
-            edit_message(
-                chat_id, mid,
-                f"✅ Книга «{label}» выбрана.\n\nНапишите номер параграфа (например: § 25) или тему урока.",
-                reply_markup={"inline_keyboard": []},
-            )
+            answer_cb(cb_id, book_label(name))
+            edit_message(chat_id, mid, book_toc_text(name),
+                         reply_markup=paragraph_keyboard(name, 0))
+        elif data.startswith("p:"):
+            # p:<индекс книги>:<номер параграфа>
+            parts = data.split(":")
+            try:
+                idx = int(parts[1])
+                num = int(parts[2])
+            except (IndexError, ValueError):
+                answer_cb(cb_id)
+                return
+            name = book_by_index(idx)
+            if not name:
+                answer_cb(cb_id, "Книга не найдена")
+                return
+            answer_cb(cb_id, f"§ {num}")
+            run_plan(chat_id, f"§ {num}", only_book=name, para_num=num, status=mid)
+        elif data.startswith("pg:"):
+            # pg:<индекс книги>:<страница>
+            parts = data.split(":")
+            try:
+                idx = int(parts[1])
+                page = int(parts[2])
+            except (IndexError, ValueError):
+                answer_cb(cb_id)
+                return
+            name = book_by_index(idx)
+            if not name:
+                answer_cb(cb_id, "Книга не найдена")
+                return
+            answer_cb(cb_id)
+            edit_message(chat_id, mid, book_toc_text(name),
+                         reply_markup=paragraph_keyboard(name, page))
         elif data == "bkx":
             state_set(chat_id, None)
             answer_cb(cb_id, "Отменено")
-            edit_message(chat_id, mid, "Выбор книги отменён.", reply_markup={"inline_keyboard": []})
+            edit_message(chat_id, mid, "Выбор отменён.", reply_markup={"inline_keyboard": []})
         else:
             answer_cb(cb_id)
     except Exception as ex:
@@ -739,11 +1111,10 @@ def handle_update(update: dict):
             )
             return
         if text.startswith("/books"):
-            names = list(BOOKS_INDEX.keys()) if BOOKS_INDEX else list(BOOKS.keys())
+            names = book_order()
             if not names:
                 send(chat_id, "Книг нет. Положи PDF в папку books.")
                 return
-            names.sort(key=lambda n: (subject_rank(n), grade_of(n), n))
             lines = []
             for name in names:
                 meta = BOOKS_META.get(name) or {}
@@ -768,33 +1139,7 @@ def handle_update(update: dict):
         selected = state_get(chat_id)
         if selected:
             state_set(chat_id, None)
-
-        status = send(chat_id, "🔍 Ищу параграф в учебниках...")
-
-        user_request = text
-        paragraph, book_name = find_paragraph(text, only_book=selected)
-        if paragraph:
-            user_request += "\n\nТекст параграфа из учебника (строй план на нём):\n" + paragraph
-            edit_message(chat_id, status, f"📖 Нашёл параграф в «{book_label(book_name) if book_name else "учебнике"}» ({len(paragraph)} символов)")
-        else:
-            edit_message(chat_id, status, "📖 Параграф в книгах не нашёл — составлю план без текста учебника.")
-
-        edit_message(chat_id, status, f"🤖 Генерирую план через {MODEL}, это займёт 1-2 минуты...")
-        answer = ask_model(user_request)
-
-        try:
-            path = Path(tempfile.gettempdir()) / f"plan_{datetime.now():%Y%m%d_%H%M%S%f}.docx"
-            make_docx(answer, str(path))
-            send_doc(chat_id, str(path), "План-конспект урока")
-            edit_message(chat_id, status, "✅ Готово! План-конспект — в документе ниже.")
-            try:
-                path.unlink()
-            except Exception:
-                pass
-        except Exception as doc_ex:
-            log.warning("DOCX error: " + str(doc_ex))
-            send(chat_id, answer)
-            edit_message(chat_id, status, "✅ Готово! Ниже — план текстом.")
+        run_plan(chat_id, text, only_book=selected)
     except Exception as ex:
         log.warning("HandleUpdate error: " + str(ex))
 
