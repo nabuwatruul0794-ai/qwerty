@@ -29,9 +29,14 @@ def read_book_direct(file: str) -> list[str]:
 
 
 def read_book_subprocess(file: str) -> list[str]:
+    # Кодировка UTF-8 задаётся явно с обеих сторон: в тексте учебников есть
+    # символы (U+2212 «−», U+2032 «′»), которые локальная кодовая страница
+    # cp1251 не умеет кодировать, и subprocess падает на print().
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
     psi = subprocess.run(
         [sys.executable, str(BOT_SCRIPT), "--read-book", file],
-        capture_output=True, text=True, cwd=str(ROOT),
+        capture_output=True, text=True, encoding="utf-8", cwd=str(ROOT), env=env,
     )
     if psi.stderr.strip():
         print(psi.stderr.strip())
