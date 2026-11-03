@@ -63,7 +63,9 @@ def find_dir_up(dirname: str, start: Path) -> Optional[Path]:
             return None
         d = d.parent
 
-BASE_DIR = Path(sys.argv[0]).resolve().parent
+# Каталог проекта. Берём от __file__, а не от sys.argv[0]: под gunicorn
+# argv[0] — путь к самому gunicorn, и books_index/.env искались бы не там.
+BASE_DIR = Path(__file__).resolve().parent
 env_path = find_up(".env", BASE_DIR)
 env_dict = load_env_dict(env_path) if env_path else {}
 
@@ -81,7 +83,7 @@ TOKEN = get_env("TELEGRAM_BOT_TOKEN")
 OWNER_ID = int(get_env("OWNER_ID"))
 ZEN_KEY = get_env("OPENCODE_API_KEY")
 MODEL = get_env("OPENCODE_MODEL", "claude-sonnet-5-5")
-PUBLIC_URL = get_env("PUBLIC_URL").rstrip("/")
+PUBLIC_URL = get_env("PUBLIC_URL", "").rstrip("/")
 
 ALLOWED_USERS = {OWNER_ID, 1329641372, 1079330932, 1079918562, 5206288199}
 
@@ -142,15 +144,67 @@ BOOKS: Dict[str, List[str]] = {}
 # Готовый текстовый индекс (books_index/*.txt.gz) - грузится мгновенно,
 # потому что чтение PDF на free-плане Render занимает десятки минут.
 BOOKS_INDEX: Dict[str, Path] = {}
+# Метаданные из manifest.json: кол-во строк, исходный PDF.
+BOOKS_META: Dict[str, Dict[str, object]] = {}
 _books_lock = threading.Lock()
 
-def load_books_index(index_dir: Path) -> Dict[str, Path]:
+SUBJECT_LABELS: Dict[str, str] = {
+    "fizika": "Физика",
+    "informatika": "Информатика",
+    "algebra": "Алгебра",
+    "geometriya": "Геометрия",
+    "matem": "Математика",
+}
+SUBJECT_SHORT: Dict[str, str] = {
+    "fizika": "Физ",
+    "informatika": "Инф",
+    "algebra": "Алг",
+    "geometriya": "Гео",
+    "matem": "Мат",
+}
+
+
+def parse_book_name(name: str) -> Tuple[str, str]:
+    """'fizika-10.pdf' -> ('fizika', '10')."""
+    base = re.sub(r"\.(pdf|txt)(\.gz)?$", "", name, flags=re.IGNORECASE)
+    m = re.match(r"^([a-z]+)-(\d+)", base, re.IGNORECASE)
+    if m:
+        return m.group(1).lower(), m.group(2)
+    return base.lower(), ""
+
+
+def book_label(name: str) -> str:
+    """Человеческое название книги: 'Алгебра 10'."""
+    subj, grade = parse_book_name(name)
+    title = SUBJECT_LABELS.get(subj, subj)
+    return f"{title} {grade}" if grade else title
+
+
+def book_short_label(name: str) -> str:
+    """Короткая подпись для кнопки: 'Алг 10'."""
+    subj, grade = parse_book_name(name)
+    short = SUBJECT_SHORT.get(subj, subj[:4])
+    return f"{short} {grade}" if grade else short
+
+
+def grade_of(name: str) -> int:
+    _, grade = parse_book_name(name)
+    return int(grade) if grade.isdigit() else 0
+
+
+def load_books_index(index_dir: Path) -> Tuple[Dict[str, Path], Dict[str, Dict[str, object]]]:
     idx: Dict[str, Path] = {}
+    meta: Dict[str, Dict[str, object]] = {}
     manifest = index_dir / "manifest.json"
     names: List[str] = []
     if manifest.exists():
         try:
-            names = list(json.loads(manifest.read_text(encoding="utf-8")).keys())
+            raw = json.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    names.append(key)
+                    if isinstance(value, dict):
+                        meta[key] = value
         except Exception as ex:
             log.warning(f"Не удалось прочитать manifest.json: {ex}")
     if not names:
@@ -160,7 +214,7 @@ def load_books_index(index_dir: Path) -> Dict[str, Path]:
         if p.exists():
             idx[name] = p
     log.info(f"Индекс книг: {len(idx)} шт в {index_dir}")
-    return idx
+    return idx, meta
 
 def get_book(name: str) -> List[str]:
     """Текст книги из индекса, с кэшем в памяти. Читает только запрошенную книгу."""
@@ -181,11 +235,11 @@ def get_book(name: str) -> List[str]:
         return lines
 
 def warmup_books() -> None:
-    global BOOKS_INDEX
+    global BOOKS_INDEX, BOOKS_META
     try:
         index_dir = find_dir_up("books_index", BASE_DIR)
         if index_dir:
-            BOOKS_INDEX = load_books_index(index_dir)
+            BOOKS_INDEX, BOOKS_META = load_books_index(index_dir)
         books_dir = find_dir_up("books", BASE_DIR)
         if books_dir and not BOOKS_INDEX:
             log.info("Индекс не найден - читаю PDF напрямую (на free-плане это очень медленно)")
@@ -240,7 +294,7 @@ def load_books(books_dir: Path) -> Dict[str, List[str]]:
     return result
 
 # ---------- Поиск параграфа ----------
-def find_paragraph(request: str) -> Tuple[Optional[str], Optional[str]]:
+def find_paragraph(request: str, only_book: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
     I = re.IGNORECASE
     MAX_CHARS = 25000
 
@@ -265,15 +319,19 @@ def find_paragraph(request: str) -> Tuple[Optional[str], Optional[str]]:
         elif re.search(r"(?<![а-яёa-zA-Z])(?:программ|алгоритм|паскаль|питон|python|компьютер)", request, I): subject = "informatika"
 
     candidate_names = list(BOOKS_INDEX.keys()) if BOOKS_INDEX else list(BOOKS.keys())
-    if subject:
-        f = [k for k in candidate_names if subject in k.lower()]
-        if explicit_subject or f:
-            candidate_names = f
-    if grade:
-        gr = re.compile(rf"-{grade}(?!\d)")
-        f = [k for k in candidate_names if gr.search(k)]
-        if explicit_subject or f:
-            candidate_names = f
+    if only_book:
+        # Книга выбрана кнопкой - ищем только в ней.
+        candidate_names = [only_book]
+    else:
+        if subject:
+            f = [k for k in candidate_names if subject in k.lower()]
+            if explicit_subject or f:
+                candidate_names = f
+        if grade:
+            gr = re.compile(rf"-{grade}(?!\d)")
+            f = [k for k in candidate_names if gr.search(k)]
+            if explicit_subject or f:
+                candidate_names = f
     if not candidate_names:
         log.debug("find_paragraph: подходящих книг не найдено")
         return (None, None)
@@ -315,6 +373,7 @@ def find_paragraph(request: str) -> Tuple[Optional[str], Optional[str]]:
             if num != -1:
                 head = re.match(r"^§\s*(\d+)", lines[starts[k]])
                 hit = bool(head and int(head.group(1)) == num)
+                score = 0
             else:
                 title = lines[starts[k]]
                 if starts[k] + 1 < end:
@@ -377,7 +436,8 @@ def make_docx(plan: str, path: str):
     doc.save(path)
 
 # ---------- Telegram ----------
-def tg_post(method: str, data: dict, files: Optional[dict] = None) -> bool:
+def tg_post(method: str, data: dict, files: Optional[dict] = None) -> Optional[dict]:
+    """Отправляет запрос в Telegram API. Возвращает разобранный JSON-ответ или None."""
     url = API_BASE + method
     try:
         if files is None:
@@ -398,37 +458,123 @@ def tg_post(method: str, data: dict, files: Optional[dict] = None) -> bool:
             body = b"\r\n".join(parts)
             req = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         with urllib.request.urlopen(req, timeout=60) as resp:
-            resp.read()
+            raw = resp.read()
         log.debug(f"Telegram {method} OK")
-        return True
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {"ok": True}
+        return parsed if isinstance(parsed, dict) else {"ok": True}
     except Exception as e:
         log.warning(f"Telegram {method} error: {e}")
-        return False
+        return None
 
-def send(chat_id: int, text: str) -> Optional[int]:
-    """Отправляет сообщение, возвращает message_id."""
-    if not text or not text.strip():
-        text = "(пустой ответ)"
-    msg_id = None
-    while text:
-        length = min(4000, len(text))
-        if length < len(text):
-            cut = text.rfind("\n", 0, length - 1)
+
+def split_text(text: str, limit: int = 4000) -> List[str]:
+    """Режет текст на части не длиннее limit, не разрывая строки по возможности."""
+    chunks: List[str] = []
+    rest = text
+    while rest:
+        length = min(limit, len(rest))
+        if length < len(rest):
+            cut = rest.rfind("\n", 0, length - 1)
             if cut > 1000:
                 length = cut + 1
-        resp = tg_post("sendMessage", {"chat_id": chat_id, "text": text[:length]})
-        if resp and "result" in resp:
+        chunks.append(rest[:length])
+        rest = rest[length:]
+    return chunks
+
+
+def send(chat_id: int, text: str, reply_markup: Optional[dict] = None) -> Optional[int]:
+    """Отправляет сообщение, возвращает message_id последнего отправленного сообщения."""
+    if not text or not text.strip():
+        text = "(пустой ответ)"
+    chunks = split_text(text)
+    msg_id = None
+    for i, chunk in enumerate(chunks):
+        payload: Dict[str, object] = {"chat_id": chat_id, "text": chunk}
+        if reply_markup and i == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+        resp = tg_post("sendMessage", payload)
+        if resp and resp.get("ok") and isinstance(resp.get("result"), dict):
             msg_id = resp["result"].get("message_id")
-        text = text[length:]
+        else:
+            log.warning(f"sendMessage не вернул message_id: {str(resp)[:200]}")
     return msg_id
 
 
-def edit_message(chat_id: int, message_id: int, text: str) -> bool:
+def edit_message(chat_id: int, message_id: int, text: str, reply_markup: Optional[dict] = None) -> bool:
     """Редактирует существующее сообщение (для прогресс-бара)."""
+    if message_id is None:
+        return False
     if not text or not text.strip():
         text = "(пустой ответ)"
-    resp = tg_post("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text[:4000]})
+    payload: Dict[str, object] = {"chat_id": chat_id, "message_id": message_id, "text": text[:4000]}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    resp = tg_post("editMessageText", payload)
     return bool(resp and resp.get("ok"))
+
+
+def answer_cb(callback_id: str, text: str = "") -> bool:
+    """Снимает «часики» на кнопке и показывает короткий ответ."""
+    if not callback_id:
+        return False
+    payload: Dict[str, object] = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text[:200]
+    resp = tg_post("answerCallbackQuery", payload)
+    return bool(resp and resp.get("ok"))
+
+
+def books_keyboard() -> Optional[dict]:
+    """Инлайн-кнопки выбора книги, сгруппированные по предмету."""
+    names = list(BOOKS_INDEX.keys()) if BOOKS_INDEX else list(BOOKS.keys())
+    if not names:
+        return None
+    names.sort(key=lambda n: (subject_rank(n), grade_of(n), n))
+    buttons = [{"text": book_short_label(n), "callback_data": f"bk:{n}"} for n in names]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([{"text": "✖️ Отмена", "callback_data": "bkx"}])
+    return {"inline_keyboard": rows}
+
+
+# ---------- Состояние выбора книги ----------
+# Живёт в файле, а не в памяти: под gunicorn работает несколько воркеров
+# и выбранная книга должна быть видна тому воркеру, который примет следующее сообщение.
+STATE_PATH = Path(tempfile.gettempdir()) / "bottg_state.json"
+_state_lock = threading.Lock()
+
+
+def _load_state() -> Dict[str, str]:
+    try:
+        if STATE_PATH.exists():
+            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+    except Exception as ex:
+        log.warning(f"Не удалось прочитать состояние: {ex}")
+    return {}
+
+
+def state_get(chat_id: int) -> Optional[str]:
+    with _state_lock:
+        return _load_state().get(str(chat_id))
+
+
+def state_set(chat_id: int, book: Optional[str]) -> None:
+    with _state_lock:
+        data = _load_state()
+        if book:
+            data[str(chat_id)] = book
+        else:
+            data.pop(str(chat_id), None)
+        try:
+            tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(STATE_PATH))
+        except Exception as ex:
+            log.warning(f"Не удалось сохранить состояние: {ex}")
 
 
 def send_doc(chat_id: int, path: str, caption: str):
@@ -526,8 +672,49 @@ def ask_model(user_request: str) -> str:
     return "".join(result)
 
 # ---------- Обработка обновления ----------
+def handle_callback_query(cb: dict) -> None:
+    """Обработка нажатия на инлайн-кнопку (выбор книги)."""
+    try:
+        from_id = cb["from"]["id"]
+        if from_id not in ALLOWED_USERS:
+            return
+        msg = cb.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        mid = msg.get("message_id")
+        data = cb.get("data") or ""
+        cb_id = cb.get("id") or ""
+        if not chat_id:
+            return
+
+        if data.startswith("bk:"):
+            name = data[3:]
+            if name not in BOOKS_INDEX and name not in BOOKS:
+                answer_cb(cb_id, "Книга не найдена")
+                return
+            state_set(chat_id, name)
+            label = book_label(name)
+            answer_cb(cb_id, f"Выбрана: {label}")
+            edit_message(
+                chat_id, mid,
+                f"✅ Книга «{label}» выбрана.\n\nНапишите номер параграфа (например: § 25) или тему урока.",
+                reply_markup={"inline_keyboard": []},
+            )
+        elif data == "bkx":
+            state_set(chat_id, None)
+            answer_cb(cb_id, "Отменено")
+            edit_message(chat_id, mid, "Выбор книги отменён.", reply_markup={"inline_keyboard": []})
+        else:
+            answer_cb(cb_id)
+    except Exception as ex:
+        log.warning(f"HandleCallbackQuery error: {ex}")
+
+
 def handle_update(update: dict):
     try:
+        cb = update.get("callback_query")
+        if cb:
+            handle_callback_query(cb)
+            return
         msg = update.get("message")
         if not msg or "text" not in msg:
             return
@@ -542,18 +729,28 @@ def handle_update(update: dict):
         global MODEL
 
         if text.startswith("/start"):
-            send(chat_id, "Привет. Бот делает план-конспекты по физике, математике и информатике.\nНапиши класс, предмет и номер параграфа, например: 10 класс, физика, § 25.\n/books - список книг\n/models - модели\n/model имя - сменить модель")
+            send(
+                chat_id,
+                "Привет. Бот делает план-конспекты по физике, математике и информатике.\n"
+                "Выбери книгу кнопками ниже или напиши класс, предмет и номер параграфа, "
+                "например: 10 класс, физика, § 25.\n"
+                "/books - список книг\n/models - модели\n/model имя - сменить модель",
+                reply_markup=books_keyboard(),
+            )
             return
         if text.startswith("/books"):
-            if BOOKS_INDEX:
-                lines = []
-                for name in sorted(BOOKS_INDEX.keys()):
-                    lines.append(f"- {name} (в индексе)")
-                send(chat_id, "Доступные книги:\n" + "\n".join(lines))
-            elif BOOKS:
-                send(chat_id, "\n".join(f"- {k} ({len(v)} строк)" for k, v in BOOKS.items()))
-            else:
+            names = list(BOOKS_INDEX.keys()) if BOOKS_INDEX else list(BOOKS.keys())
+            if not names:
                 send(chat_id, "Книг нет. Положи PDF в папку books.")
+                return
+            names.sort(key=lambda n: (subject_rank(n), grade_of(n), n))
+            lines = []
+            for name in names:
+                meta = BOOKS_META.get(name) or {}
+                count = meta.get("lines")
+                suffix = f" ({count} строк)" if isinstance(count, int) else " (в индексе)"
+                lines.append(f"- {book_label(name)}{suffix}")
+            send(chat_id, "Доступные книги:\n" + "\n".join(lines), reply_markup=books_keyboard())
             return
         if text.startswith("/models"):
             send(chat_id, models_list())
@@ -567,23 +764,29 @@ def handle_update(update: dict):
                 send(chat_id, "Такой модели нет.\n\n" + models_list())
             return
 
+        # Книга, выбранная кнопкой, действует на один запрос.
+        selected = state_get(chat_id)
+        if selected:
+            state_set(chat_id, None)
+
+        status = send(chat_id, "🔍 Ищу параграф в учебниках...")
+
         user_request = text
-        paragraph, book_name = find_paragraph(text)
+        paragraph, book_name = find_paragraph(text, only_book=selected)
         if paragraph:
             user_request += "\n\nТекст параграфа из учебника (строй план на нём):\n" + paragraph
-            send(chat_id, f"Нашёл параграф в книге «{book_name}» ({len(paragraph)} символов).")
-        elif not BOOKS:
-            pass
+            edit_message(chat_id, status, f"📖 Нашёл параграф в «{book_label(book_name) if book_name else "учебнике"}» ({len(paragraph)} символов)")
         else:
-            send(chat_id, "Параграф в книгах не нашёл. Составлю план без текста учебника.")
+            edit_message(chat_id, status, "📖 Параграф в книгах не нашёл — составлю план без текста учебника.")
 
-        send(chat_id, f"Готовлю план урока ({MODEL}), это займёт 1-2 минуты...")
+        edit_message(chat_id, status, f"🤖 Генерирую план через {MODEL}, это займёт 1-2 минуты...")
         answer = ask_model(user_request)
 
         try:
             path = Path(tempfile.gettempdir()) / f"plan_{datetime.now():%Y%m%d_%H%M%S%f}.docx"
             make_docx(answer, str(path))
             send_doc(chat_id, str(path), "План-конспект урока")
+            edit_message(chat_id, status, "✅ Готово! План-конспект — в документе ниже.")
             try:
                 path.unlink()
             except Exception:
@@ -591,6 +794,7 @@ def handle_update(update: dict):
         except Exception as doc_ex:
             log.warning("DOCX error: " + str(doc_ex))
             send(chat_id, answer)
+            edit_message(chat_id, status, "✅ Готово! Ниже — план текстом.")
     except Exception as ex:
         log.warning("HandleUpdate error: " + str(ex))
 
@@ -613,19 +817,23 @@ def webhook():
     threading.Thread(target=handle_update, args=(update,), daemon=True).start()
     return jsonify({"status": "ok"})
 
-# ---------- Точка входа ----------
-if __name__ == "__main__":
-    if len(sys.argv) >= 2 and sys.argv[1] == "--read-book":
-        r = read_book_one(sys.argv[2])
-        if r is None:
-            print("null")
-        else:
-            print(json.dumps(r, ensure_ascii=False))
-        sys.exit(0)
+# ---------- Старт ----------
+def _is_read_book_cli() -> bool:
+    return len(sys.argv) >= 2 and sys.argv[1] == "--read-book"
 
+
+def startup() -> None:
+    """Стартовые действия: фоновая загрузка книг и установка вебхука.
+
+    Вызывается при импорте модуля, потому что gunicorn не выполняет блок
+    __main__, а запускает приложение как WSGI-объект.
+    """
     threading.Thread(target=warmup_books, daemon=True).start()
     log.info(f"Сервер стартует сразу, книги грузятся в фоне. Модель: {MODEL}")
 
+    if not PUBLIC_URL:
+        log.warning("PUBLIC_URL не задан — вебхук не устанавливаю")
+        return
     try:
         webhook_url = f"{PUBLIC_URL}/webhook"
         log.info(f"Устанавливаю вебхук: {webhook_url}")
@@ -634,5 +842,26 @@ if __name__ == "__main__":
             log.info(f"setWebhook ответ: {resp.read().decode()}")
     except Exception as e:
         log.warning(f"Ошибка установки вебхука: {e}")
+
+
+def _startup_enabled() -> bool:
+    if os.environ.get("BOTTG_SKIP_STARTUP") == "1":
+        return False
+    return not _is_read_book_cli()
+
+
+if _startup_enabled():
+    startup()
+
+
+# ---------- Точка входа ----------
+if __name__ == "__main__":
+    if _is_read_book_cli():
+        r = read_book_one(sys.argv[2])
+        if r is None:
+            print("null")
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        sys.exit(0)
 
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
