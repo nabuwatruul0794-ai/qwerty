@@ -83,7 +83,7 @@ ZEN_KEY = get_env("OPENCODE_API_KEY")
 MODEL = get_env("OPENCODE_MODEL", "claude-sonnet-5-5")
 PUBLIC_URL = get_env("PUBLIC_URL").rstrip("/")
 
-ALLOWED_USERS = {OWNER_ID, 1329641372, 1079330932, 1079918562}
+ALLOWED_USERS = {OWNER_ID, 1329641372, 1079330932, 1079918562, 5206288199}
 
 MODELS: Dict[str, str] = {
     "haiku": "claude-haiku-5-5",
