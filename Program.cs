@@ -1,4 +1,5 @@
-﻿using System.Net.Http.Headers;
+﻿using System.Diagnostics;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -7,6 +8,35 @@ using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Wordprocessing;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.DocumentLayoutAnalysis.TextExtractor;
+
+// ---------- Режим: прочитать одну книгу в отдельном процессе ----------
+if (args.Length >= 2 && args[0] == "--read-book")
+{
+    var file = args[1];
+    try
+    {
+        var lines = new List<string>();
+        using var pdf = PdfDocument.Open(file);
+        foreach (var page in pdf.GetPages())
+        {
+            var pageText = ContentOrderTextExtractor.GetText(page);
+            foreach (var l in pageText.Split('\n'))
+            {
+                var t = l.Trim();
+                if (t.Length > 0) lines.Add(t);
+            }
+        }
+        var name = Path.GetFileNameWithoutExtension(file);
+        Console.Error.WriteLine($"Прочитана книга: {Path.GetFileName(file)} ({lines.Count} строк)");
+        Console.WriteLine(JsonSerializer.Serialize(new { name, lines }));
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Не удалось прочитать {Path.GetFileName(file)}: {ex.Message}");
+        Console.WriteLine("null");
+    }
+    return;
+}
 
 // ---------- Вспомогательные ----------
 static string FindEnv()
@@ -151,26 +181,46 @@ Dictionary<string, List<string>> LoadBooks()
         Console.WriteLine("Папка books не найдена.");
         return result;
     }
-    foreach (var file in Directory.GetFiles(dir, "*.pdf"))
+
+    var files = Directory.GetFiles(dir, "*.pdf")
+        .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+        .OrderBy(f =>
+        {
+            var n = Path.GetFileName(f).ToLowerInvariant();
+            if (n.Contains("fizika")) return 0;
+            if (n.Contains("informatika")) return 1;
+            if (n.Contains("algebra")) return 2;
+            if (n.Contains("geometriya")) return 3;
+            if (n.Contains("matem")) return 4;
+            return 5;
+        })
+        .ToList();
+
+    foreach (var file in files)
     {
         try
         {
-            var lines = new List<string>();
-            using var pdf = PdfDocument.Open(file);
-            foreach (var page in pdf.GetPages())
+            var psi = new ProcessStartInfo
             {
-                var pageText = ContentOrderTextExtractor.GetText(page);
-                foreach (var l in pageText.Split('\n'))
-                {
-                    var t = l.Trim();
-                    if (t.Length > 0) lines.Add(t);
-                }
-            }
-            var name = Path.GetFileNameWithoutExtension(file);
+                FileName = Process.GetCurrentProcess().MainModule.FileName,
+                Arguments = $"--read-book \"{file}\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi)!;
+            proc.WaitForExit();
+            var json = proc.StandardOutput.ReadToEnd().Trim();
+            var stderr = proc.StandardError.ReadToEnd().Trim();
+            if (!string.IsNullOrEmpty(stderr)) Console.WriteLine(stderr);
+            if (json == "null") continue;
+            using var doc = JsonDocument.Parse(json);
+            var name = doc.RootElement.GetProperty("name").GetString()!;
+            var lines = doc.RootElement.GetProperty("lines").EnumerateArray()
+                .Select(x => x.GetString()!).Where(s => s.Length > 0).ToList();
             result[name] = lines;
             Console.WriteLine($"Загружена книга: {Path.GetFileName(file)} ({lines.Count} строк)");
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
         }
         catch (Exception ex)
         {
