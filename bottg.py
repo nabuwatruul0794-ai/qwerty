@@ -352,8 +352,12 @@ def _scan_headings(lines: List[str]) -> List[List[object]]:
             title = line[:line.rfind("§")].strip()
             num, j = _number_ahead(lines, i + 1)
             if num is not None and not _BAD_TITLE.search(title) \
-                    and not _PREP_END.search(title) and _LETTERS3.search(title):
-                out.append([num, j, _clean_title(title)])
+                    and not _PREP_END.search(title):
+                rest = ""
+                m2 = re.match(r"^\s*\d(?:\s*\d)*\s*\.?\s*(.*)$", lines[j])
+                if m2:
+                    rest = m2.group(1).strip()
+                out.append([num, j, _clean_title((title + " " + rest).strip())])
                 i = j + 1
                 continue
         i += 1
@@ -382,14 +386,102 @@ def _dot_leader_regions(lines: List[str], gap: int = 40, min_lines: int = 3) -> 
     return regions
 
 
-def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
-    """Список параграфов книги с их границами в тексте."""
-    occ = _scan_headings(lines)
-    if not occ:
-        return []
-    gaps = [int(occ[k + 1][1]) - int(occ[k][1]) for k in range(len(occ) - 1)]
+_TOC_CHAPTER = re.compile(r"^(Глава|ГЛАВА|Раздел|РАЗДЕЛ)\b")
+_FOOTER = re.compile(r"^(Правообладатель|Минск\s)")
 
-    # Блок содержания: плотная кучка заголовков либо заголовок с точечными выносками.
+
+_SHORT_WORDS = {
+    "с", "и", "в", "о", "у", "к", "а", "я", "на", "из", "за", "по", "до", "не", "но",
+    "же", "ли", "бы", "то", "их", "для", "от", "под", "над", "при", "через", "без",
+    "между", "или", "так", "как", "что", "это", "все", "его", "ее", "её", "мы", "вы",
+    "он", "она", "они", "оно", "им", "их", "ему", "ней", "нет", "да", "же", "бы", "то",
+}
+
+
+def _join_fragments(frags: List[str]) -> str:
+    """Склеивает куски названия из содержания.
+
+    Перенос строки в содержании - это либо перенос слова (дефис), либо
+    просто разбивка длинного названия на несколько строк.
+    """
+    out = ""
+    last_frag = ""
+    pending_hyphen = False
+    for frag in frags:
+        if frag == "-":
+            pending_hyphen = True        # дефис отдельной строкой
+            continue
+        if not out:
+            out = frag
+            last_frag = frag
+            continue
+        if pending_hyphen or out.endswith("-"):
+            out = out.rstrip("-") + frag  # слово разорвано переносом
+        elif (len(last_frag) <= 3 and last_frag.isalpha()
+              and last_frag.lower() not in _SHORT_WORDS
+              and frag[:1].isalpha() and frag[:1].islower()
+              and frag.split(" ")[0].lower() not in _SHORT_WORDS):
+            out = out + frag               # кусок слова: "Ди" + "на" -> "Дина"
+        else:
+            out = out + " " + frag
+        last_frag = frag
+        pending_hyphen = False
+    return out
+
+
+def _fix_split_word(text: str) -> str:
+    """Склеивает разорванное слово: 'дви' + 'жение.' -> 'движение.'."""
+    words = text.split(" ")
+    out: List[str] = []
+    for w in words:
+        m = re.match(r"^([а-яё]+)([^а-яё]*)$", w)
+        if not m:
+            out.append(w)
+            continue
+        core, tail = m.group(1), m.group(2)
+        if (out and len(out[-1]) <= 3 and out[-1].isalpha()
+                and out[-1].lower() not in _SHORT_WORDS
+                and core and core[0].islower() and core.lower() not in _SHORT_WORDS):
+            out[-1] = out[-1] + core + tail
+        else:
+            out.append(w)
+    return " ".join(out)
+
+
+def _toc_title(lines: List[str], idx: int, first: str) -> str:
+    """Полное название параграфа из содержания.
+
+    В содержании название разбито на несколько строк, а иногда и слово
+    разорвано переносом ("Ди" + "на" + "мометр" -> "Динамометр").
+    """
+    frags: List[str] = []
+    if first.strip():
+        frags.append(first.strip())
+    j = idx + 1
+    while j < len(lines) and j < idx + 14:
+        s = _norm_ws(lines[j])
+        if not s:
+            break
+        if s.startswith("§") or _TOC_CHAPTER.match(s) or _FOOTER.match(s):
+            break
+        if re.fullmatch(r"\d{1,4}", s):
+            break                      # отдельная строка с номером страницы
+        if _PLAIN_RE.match(s) and _LETTERS3.search(s):
+            break                      # начало следующего пункта содержания
+        if len(s) > 70 or s.lower().startswith("рис"):
+            break                      # это уже текст тела, а не название
+        frags.append(s)
+        j += 1
+
+    out = _join_fragments(frags)
+    out = re.sub(r"[\s.·]*\d{1,4}\s*$", "", out)     # номер страницы
+    out = re.sub(r"[\s.·.]+$", "", out)                 # хвостовые точки
+    return _fix_split_word(re.sub(r"\s{2,}", " ", out).strip(" .·"))
+
+
+def _toc_regions(lines: List[str], occ: List[List[object]]) -> Tuple[List[bool], List[Tuple[int, int]]]:
+    """Какие заголовки относятся к содержанию и где оно расположено."""
+    gaps = [int(occ[k + 1][1]) - int(occ[k][1]) for k in range(len(occ) - 1)]
     toc_flag = [False] * len(occ)
     regions: List[Tuple[int, int]] = []
     k = 0
@@ -406,9 +498,17 @@ def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
     for t, o in enumerate(occ):
         if not toc_flag[t]:
             idx = int(o[1])
-            # заголовок может стоять чуть выше первого выноски
             if any(a - 20 <= idx <= b for a, b in regions):
                 toc_flag[t] = True
+    return toc_flag, regions
+
+
+def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
+    """Список параграфов книги с их границами в тексте."""
+    occ = _scan_headings(lines)
+    if not occ:
+        return []
+    toc_flag, regions = _toc_regions(lines, occ)
 
     def in_toc(idx: int) -> bool:
         return any(a <= idx <= b for a, b in regions)
@@ -421,11 +521,17 @@ def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
         if num not in paras:
             paras[num] = {"num": num, "start": idx, "title": title}
 
-    # Названия из содержания - запасной источник.
+    # Названия из содержания - запасной источник (в теле заголовок не всегда есть).
     toc_titles: Dict[int, str] = {}
-    for o in occ:
-        if o[2] and int(o[0]) not in toc_titles:
-            toc_titles[int(o[0])] = str(o[2])
+    for t, o in enumerate(occ):
+        if not toc_flag[t]:
+            continue
+        num = int(o[0])
+        if num in toc_titles:
+            continue
+        full = _toc_title(lines, int(o[1]), str(o[2]))
+        if full:
+            toc_titles[num] = full
     max_sec = max([int(o[0]) for o in occ] + [0])
 
     # Номера, записанные без знака § ("19. Почему") - ищем только внутри содержания.
@@ -474,6 +580,17 @@ def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
                     break
 
     starts = sorted(paras.values(), key=lambda p: int(p["start"]))
+    # Название параграфа: из тела оно точнее, из содержания - полнее.
+    # Если название из тела - лишь часть названия из содержания, берём полное.
+    for p in starts:
+        body_title = _fix_split_word(str(p.get("title") or "").strip())
+        toc_title = toc_titles.get(int(p["num"]), "")
+        if len(toc_title) > 110:
+            toc_title = toc_title[:110].rsplit(" ", 1)[0]
+        if body_title and body_title.replace(" ", "") in toc_title.replace(" ", ""):
+            p["title"] = toc_title
+        else:
+            p["title"] = body_title if body_title else toc_title
     for i, p in enumerate(starts):
         end = len(lines)
         for q in starts[i + 1:]:
