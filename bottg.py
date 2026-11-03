@@ -189,7 +189,7 @@ def find_paragraph(request: str) -> Tuple[Optional[str], Optional[str]]:
     I = re.IGNORECASE
     MAX_CHARS = 25000
 
-    grade_rx = re.compile(r"(\d{1,2})\s*(?:-?\s*[а-яё]{1,2})?\s*(?:класс\p{L}*|кл\b)", I)
+    grade_rx = re.compile(r"(\d{1,2})\s*(?:-?\s*[а-яё]{1,2})?\s*(?:класс[а-яё]*|кл\b)", I)
     gm = grade_rx.search(request)
     grade = gm.group(1) if gm else None
     no_grade = grade_rx.sub(" ", request)
@@ -197,17 +197,17 @@ def find_paragraph(request: str) -> Tuple[Optional[str], Optional[str]]:
     subject: Optional[str] = None
     explicit_subject = True
 
-    if re.search(r"(?<!\p{L})физик", request, I): subject = "fizika"
-    elif re.search(r"(?<!\p{L})информатик", request, I): subject = "informatika"
-    elif re.search(r"(?<!\p{L})алгебр", request, I): subject = "algebra"
-    elif re.search(r"(?<!\p{L})геометри", request, I): subject = "geometriya"
-    elif re.search(r"(?<!\p{L})математик", request, I): subject = "matem"
+    if re.search(r"(?<![а-яёa-zA-Z])физик", request, I): subject = "fizika"
+    elif re.search(r"(?<![а-яёa-zA-Z])информатик", request, I): subject = "informatika"
+    elif re.search(r"(?<![а-яёa-zA-Z])алгебр", request, I): subject = "algebra"
+    elif re.search(r"(?<![а-яёa-zA-Z])геометри", request, I): subject = "geometriya"
+    elif re.search(r"(?<![а-яёa-zA-Z])математик", request, I): subject = "matem"
     else:
         explicit_subject = False
-        if re.search(r"(?<!\p{L})(?:газ|механик|кинематик|термодинамик|электр|оптик|магнит|давлени)", request, I): subject = "fizika"
-        elif re.search(r"(?<!\p{L})(?:функци|уравнени|неравенств|тригонометр|логарифм|прогресси)", request, I): subject = "algebra"
-        elif re.search(r"(?<!\p{L})(?:планиметр|стереометр|вектор|треугольник|окружност)", request, I): subject = "geometriya"
-        elif re.search(r"(?<!\p{L})(?:программ|алгоритм|паскаль|питон|python|компьютер)", request, I): subject = "informatika"
+        if re.search(r"(?<![а-яёa-zA-Z])(?:газ|механик|кинематик|термодинамик|электр|оптик|магнит|давлени)", request, I): subject = "fizika"
+        elif re.search(r"(?<![а-яёa-zA-Z])(?:функци|уравнени|неравенств|тригонометр|логарифм|прогресси)", request, I): subject = "algebra"
+        elif re.search(r"(?<![а-яёa-zA-Z])(?:планиметр|стереометр|вектор|треугольник|окружност)", request, I): subject = "geometriya"
+        elif re.search(r"(?<![а-яёa-zA-Z])(?:программ|алгоритм|паскаль|питон|python|компьютер)", request, I): subject = "informatika"
 
     candidates = list(BOOKS.items())
     if subject:
@@ -224,7 +224,7 @@ def find_paragraph(request: str) -> Tuple[Optional[str], Optional[str]]:
         return (None, None)
 
     num = -1
-    em = re.search(r"(?:§|(?<!\p{L})(?:параграф\p{L}*|пункт\p{L}*|пар|п)\.?)\s*(\d+)", no_grade, I)
+    em = re.search(r"(?:§|(?<![а-яёa-zA-Z])(?:параграф[а-яё]*|пункт[а-яё]*|пар|п)\.?)\s*(\d+)", no_grade, I)
     if em:
         num = int(em.group(1))
     else:
@@ -235,7 +235,7 @@ def find_paragraph(request: str) -> Tuple[Optional[str], Optional[str]]:
     ignore_stems = {"физик", "инфор", "алгеб", "геоме", "матем", "параг", "урок", "конс", "класс", "соста", "сдела", "план", "тема", "теме", "пожал", "нужен", "нужна"}
     stems: List[str] = []
     seen = set()
-    for m in re.finditer(r"\p{L}{4,}", no_grade.lower()):
+    for m in re.finditer(r"[а-яёa-zA-Z]{4,}", no_grade.lower()):
         word = m.group(0)
         s = word[:5] if len(word) > 5 else word
         if s not in ignore_stems and s not in seen:
