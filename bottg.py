@@ -108,7 +108,7 @@ API_BASE = f"https://api.telegram.org/bot{TOKEN}/"
 MODEL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = r"""
 Ты помощник учителя физики, математики и информатики в Беларуси. Ты составляешь подробный план-конспект урока.
 
 Пиши по-русски простым текстом, без символов Markdown (без **, #, таблиц с |).
@@ -135,6 +135,13 @@ SYSTEM_PROMPT = """
 9. Литература.
 
 Правила:
+- Все формулы, величины и обозначения записывай в LaTeX внутри $...$:
+  индексы через подчёркивание ($v_x$, $a_0$, $v_{1x}$), дроби через \frac с фигурными скобками
+  ($\frac{3}{4}$, $\frac{\Delta x}{\Delta t}$), степени через ^ ($x^2$, $v^{2}$), корни через \sqrt
+  ($\sqrt{2}$, $\sqrt[3]{5}$), греческие буквы как $\alpha$, $\beta$, $\pi$, десятичная запятая
+  внутри фигурных скобок ($2{,}5$).
+  Если в тексте учебника формула слиплась (например «x x− + − =43 12 3» или «v1x = v1 = 2,0 мс»),
+  восстанови её по смыслу и запиши в LaTeX. Формулу в обычном виде не оставляй никогда.
 - Класс, предмет, учебник и номер параграфа всегда указаны в запросе (строка "Данные об уроке"). Бери их оттуда точно и подставляй в шапку плана. НИКОГДА не пиши вместо класса или параграфа «[уточнить по учебнику]» - эти данные уже есть.
 - К абсолютно любой sгенерированной задаче, проблемному вопросу или практическому заданию на любом этапе урока ТЫ ОБЯЗАН предоставить ПОЛНОЕ ХОД РЕШЕНИЯ с формулами, промежуточными расчетами и финальным ответом. Не ограничивайся только кратким ответом.
 - Если в запросе приведён текст параграфа учебника, строй план строго на нём: используй его определения, примеры, опыты, контрольные вопросы и упражнения.
@@ -663,6 +670,37 @@ def is_heading(line: str) -> bool:
              "Методы и формы работы", "Оборудование", "Ход урока", "Главные выводы", "Литература"}
     return any(line.startswith(n) for n in names)
 
+def _fill_paragraph(p, line: str, bold: bool = False) -> None:
+    """Заполняет абзац текстом и формулами: $...$ превращается в родную формулу Word."""
+    from docx.shared import Pt
+
+    def add_text(chunk: str):
+        if not chunk:
+            return
+        run = p.add_run(chunk)
+        run.font.name = "Times New Roman"
+        run.font.size = Pt(12)
+        run.bold = bold
+
+    try:
+        import latex_omml
+    except Exception as ex:
+        log.warning(f"Не удалось загрузить latex_omml: {ex}")
+        latex_omml = None
+
+    pos = 0
+    for m in (latex_omml.MATH_SPAN_RE.finditer(line) if latex_omml else []):
+        add_text(line[pos:m.start()])
+        latex = m.group(1) if m.group(1) is not None else m.group(2)
+        try:
+            p._p.append(latex_omml.omml_element(latex))
+        except Exception as ex:
+            log.warning(f"Формулу не удалось превратить в OMML ({ex}) - оставляю LaTeX")
+            add_text(latex)
+        pos = m.end()
+    add_text(line[pos:])
+
+
 def make_docx(plan: str, path: str):
     from docx import Document
     from docx.shared import Pt
@@ -677,10 +715,7 @@ def make_docx(plan: str, path: str):
             line = "• " + line[2:]
         heading = is_heading(line)
         p = doc.add_paragraph()
-        run = p.add_run(line)
-        run.font.name = "Times New Roman"
-        run.font.size = Pt(12)
-        run.bold = heading
+        _fill_paragraph(p, line, heading)
         p.paragraph_format.space_after = Pt(6)
         if bullet:
             p.paragraph_format.left_indent = Pt(36)
