@@ -405,17 +405,31 @@ def tg_post(method: str, data: dict, files: Optional[dict] = None) -> bool:
         log.warning(f"Telegram {method} error: {e}")
         return False
 
-def send(chat_id: int, text: str):
+def send(chat_id: int, text: str) -> Optional[int]:
+    """Отправляет сообщение, возвращает message_id."""
     if not text or not text.strip():
         text = "(пустой ответ)"
+    msg_id = None
     while text:
         length = min(4000, len(text))
         if length < len(text):
             cut = text.rfind("\n", 0, length - 1)
             if cut > 1000:
                 length = cut + 1
-        tg_post("sendMessage", {"chat_id": chat_id, "text": text[:length]})
+        resp = tg_post("sendMessage", {"chat_id": chat_id, "text": text[:length]})
+        if resp and "result" in resp:
+            msg_id = resp["result"].get("message_id")
         text = text[length:]
+    return msg_id
+
+
+def edit_message(chat_id: int, message_id: int, text: str) -> bool:
+    """Редактирует существующее сообщение (для прогресс-бара)."""
+    if not text or not text.strip():
+        text = "(пустой ответ)"
+    resp = tg_post("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text[:4000]})
+    return bool(resp and resp.get("ok"))
+
 
 def send_doc(chat_id: int, path: str, caption: str):
     try:
@@ -531,10 +545,15 @@ def handle_update(update: dict):
             send(chat_id, "Привет. Бот делает план-конспекты по физике, математике и информатике.\nНапиши класс, предмет и номер параграфа, например: 10 класс, физика, § 25.\n/books - список книг\n/models - модели\n/model имя - сменить модель")
             return
         if text.startswith("/books"):
-            if not BOOKS:
-                send(chat_id, "Книг нет. Положи PDF в папку books.")
-            else:
+            if BOOKS_INDEX:
+                lines = []
+                for name in sorted(BOOKS_INDEX.keys()):
+                    lines.append(f"- {name} (в индексе)")
+                send(chat_id, "Доступные книги:\n" + "\n".join(lines))
+            elif BOOKS:
                 send(chat_id, "\n".join(f"- {k} ({len(v)} строк)" for k, v in BOOKS.items()))
+            else:
+                send(chat_id, "Книг нет. Положи PDF в папку books.")
             return
         if text.startswith("/models"):
             send(chat_id, models_list())
