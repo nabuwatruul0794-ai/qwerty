@@ -787,9 +787,38 @@ def is_heading(line: str) -> bool:
              "Методы и формы работы", "Оборудование", "Ход урока", "Главные выводы", "Литература"}
     return any(line.startswith(n) for n in names)
 
-def _fill_paragraph(p, line: str, bold: bool = False) -> None:
-    """Заполняет абзац текстом и формулами: $...$ превращается в родную формулу Word."""
-    from docx.shared import Pt
+def _render_formula(latex: str, tmp_dir: Path, cache: Dict[str, Tuple[Path, float]]):
+    """Рисует формулу в PNG. Возвращает (путь, ширина в дюймах) или None."""
+    key = latex.strip()
+    if not key:
+        return None
+    if key in cache:
+        return cache[key]
+    try:
+        import latex_png
+    except Exception as ex:
+        log.warning(f"Не удалось загрузить latex_png: {ex}")
+        return None
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", key)[:36] or "formula"
+    path = tmp_dir / f"{safe}_{len(cache)}.png"
+    try:
+        width, _height = latex_png.render_formula(key, path)
+    except Exception as ex:
+        log.warning(f"Формулу не удалось отрисовать ({ex}): {key[:60]}")
+        return None
+    cache[key] = (path, width)
+    return path, width
+
+
+def _fill_paragraph(p, line: str, bold: bool = False,
+                    tmp_dir: Optional[Path] = None,
+                    cache: Optional[Dict[str, Tuple[Path, float]]] = None) -> None:
+    """Заполняет абзац текстом и формулами.
+
+    Формулы рисуются картинкой: родные формулы Word (OMML) показывает только
+    Word, а мобильные просмотрщики их не рисуют и просто вырезают.
+    """
+    from docx.shared import Inches, Pt
 
     def add_text(chunk: str):
         if not chunk:
@@ -801,19 +830,25 @@ def _fill_paragraph(p, line: str, bold: bool = False) -> None:
 
     try:
         import latex_omml
-    except Exception as ex:
-        log.warning(f"Не удалось загрузить latex_omml: {ex}")
+    except Exception:
         latex_omml = None
 
     pos = 0
     for m in (latex_omml.MATH_SPAN_RE.finditer(line) if latex_omml else []):
         add_text(line[pos:m.start()])
         latex = m.group(1) if m.group(1) is not None else m.group(2)
-        try:
-            p._p.append(latex_omml.omml_element(latex))
-        except Exception as ex:
-            log.warning(f"Формулу не удалось превратить в OMML ({ex}) - оставляю LaTeX")
-            add_text(latex)
+        img = None
+        if tmp_dir is not None and cache is not None:
+            img = _render_formula(latex, tmp_dir, cache)
+        if img:
+            path, width = img
+            try:
+                p.add_run().add_picture(str(path), width=Inches(width))
+            except Exception as ex:
+                log.warning(f"Не удалось вставить формулу в документ: {ex}")
+                add_text(latex)
+        else:
+            add_text(latex)     # не отрисовалась - оставляем LaTeX текстом
         pos = m.end()
     add_text(line[pos:])
 
@@ -825,14 +860,19 @@ def make_docx(plan: str, path: str):
     style = doc.styles["Normal"]
     style.font.name = "Times New Roman"
     style.font.size = Pt(12)
+    tmp_dir = Path(tempfile.gettempdir()) / "bottg_formulas"
+    tmp_dir.mkdir(exist_ok=True)
+    cache: Dict[str, Tuple[Path, float]] = {}
     for raw in plan.replace("\r", "").split("\n"):
         line = raw.rstrip()
+        if not line.strip():
+            continue                      # пустые строки не нужны - пробел есть в абзацах
         bullet = line.startswith("- ")
         if bullet:
             line = "• " + line[2:]
         heading = is_heading(line)
         p = doc.add_paragraph()
-        _fill_paragraph(p, line, heading)
+        _fill_paragraph(p, line, heading, tmp_dir, cache)
         p.paragraph_format.space_after = Pt(6)
         if bullet:
             p.paragraph_format.left_indent = Pt(36)
