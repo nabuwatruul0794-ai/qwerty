@@ -678,17 +678,21 @@ def tg_post(method: str, data: dict, files: Optional[dict] = None) -> Optional[d
             req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         else:
             boundary = "----WebKitFormBoundary" + os.urandom(8).hex()
-            parts: List[bytes] = []
+            # Каждый блок multipart должен заканчиваться CRLF, а между
+            # заголовком поля и его значением лишнего перевода строки быть не должно -
+            # иначе Telegram видит chat_id как "\r\n1177..." и отвечает "chat not found".
+            chunks: List[bytes] = []
             for k, v in data.items():
-                parts.append(f"--{boundary}".encode())
-                parts.append(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode())
-                parts.append(str(v).encode())
+                chunks.append(
+                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
             for k, (fname, fbytes, ctype) in files.items():
-                parts.append(f"--{boundary}".encode())
-                parts.append(f'Content-Disposition: form-data; name="{k}"; filename="{fname}"\r\nContent-Type: {ctype}\r\n\r\n'.encode())
-                parts.append(fbytes)
-            parts.append(f"--{boundary}--".encode())
-            body = b"\r\n".join(parts)
+                chunks.append(
+                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{fname}\""
+                    f"\r\nContent-Type: {ctype}\r\n\r\n".encode())
+                chunks.append(fbytes)
+                chunks.append(b"\r\n")
+            chunks.append(f"--{boundary}--".encode())
+            body = b"".join(chunks)
             req = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             raw = resp.read()
