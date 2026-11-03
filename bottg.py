@@ -135,6 +135,7 @@ SYSTEM_PROMPT = """
 9. Литература.
 
 Правила:
+- Класс, предмет, учебник и номер параграфа всегда указаны в запросе (строка "Данные об уроке"). Бери их оттуда точно и подставляй в шапку плана. НИКОГДА не пиши вместо класса или параграфа «[уточнить по учебнику]» - эти данные уже есть.
 - К абсолютно любой sгенерированной задаче, проблемному вопросу или практическому заданию на любом этапе урока ТЫ ОБЯЗАН предоставить ПОЛНОЕ ХОД РЕШЕНИЯ с формулами, промежуточными расчетами и финальным ответом. Не ограничивайся только кратким ответом.
 - Если в запросе приведён текст параграфа учебника, строй план строго на нём: используй его определения, примеры, опыты, контрольные вопросы и упражнения.
 - Не выдумывай номера страниц, рисунков, контрольных вопросов и упражнений учебника. Если нужных данных нет, pиши «[уточнить по учебнику]».
@@ -183,6 +184,18 @@ def book_label(name: str) -> str:
     subj, grade = parse_book_name(name)
     title = SUBJECT_LABELS.get(subj, subj)
     return f"{title} {grade}" if grade else title
+
+
+def book_subject(name: str) -> str:
+    """Предмет книги без класса: 'Алгебра'."""
+    subj, _ = parse_book_name(name)
+    return SUBJECT_LABELS.get(subj, subj)
+
+
+def book_class(name: str) -> Optional[int]:
+    """Класс из названия книги: 'algebra-10.pdf' -> 10."""
+    _, grade = parse_book_name(name)
+    return int(grade) if grade.isdigit() else None
 
 
 def book_short_label(name: str) -> str:
@@ -801,7 +814,7 @@ def books_keyboard() -> Optional[dict]:
         return None
     buttons = [{"text": book_short_label(n), "callback_data": f"bk:{i}"} for i, n in enumerate(names)]
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-    rows.append([{"text": "✖️ Отмена", "callback_data": "bkx"}])
+    rows.append([{"text": "Отмена", "callback_data": "bkx"}])
     return {"inline_keyboard": rows}
 
 
@@ -822,18 +835,14 @@ def paragraph_keyboard(book_name: str, page: int = 0) -> Optional[dict]:
         return None
     buttons = []
     for p in chunk:
-        label = f"§ {p['num']}"
-        title = str(p.get("title") or "")
-        if title:
-            label += f" {title[:20]}"
-        buttons.append({"text": label, "callback_data": f"p:{bidx}:{p['num']}"})
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        buttons.append({"text": f"§ {p['num']}", "callback_data": f"p:{bidx}:{p['num']}"})
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     nav: List[Dict[str, str]] = []
     if page > 0:
-        nav.append({"text": "◀️", "callback_data": f"pg:{bidx}:{page - 1}"})
+        nav.append({"text": "←", "callback_data": f"pg:{bidx}:{page - 1}"})
     if page < pages - 1:
-        nav.append({"text": "▶️", "callback_data": f"pg:{bidx}:{page + 1}"})
-    nav.append({"text": "✖️ Отмена", "callback_data": "bkx"})
+        nav.append({"text": "→", "callback_data": f"pg:{bidx}:{page + 1}"})
+    nav.append({"text": "Отмена", "callback_data": "bkx"})
     rows.append(nav)
     return {"inline_keyboard": rows}
 
@@ -841,7 +850,7 @@ def paragraph_keyboard(book_name: str, page: int = 0) -> Optional[dict]:
 def book_toc_text(book_name: str) -> str:
     """Содержание книги текстом - чтобы видеть названия параграфов."""
     paras = book_paragraphs(book_name)
-    lines = [f"📘 {book_label(book_name)} — параграфы:", ""]
+    lines = [f"{book_label(book_name)} — параграфы:", ""]
     for p in paras:
         title = str(p.get("title") or "")
         lines.append(f"§ {p['num']}" + (f". {title}" if title else ""))
@@ -996,7 +1005,7 @@ def run_plan(chat_id: int, request: str, only_book: Optional[str] = None,
              para_num: Optional[int] = None, status: Optional[int] = None) -> None:
     """Главный сценарий: найти параграф, собрать план, отправить документ."""
     if status is None:
-        status = send(chat_id, "🔍 Ищу параграф в учебниках...")
+        status = send(chat_id, "Ищу параграф в учебниках...")
 
     paragraph = ""
     book_name = only_book
@@ -1005,27 +1014,42 @@ def run_plan(chat_id: int, request: str, only_book: Optional[str] = None,
     else:
         paragraph, book_name = find_paragraph(request, only_book=only_book)
 
+    # Класс и учебник известны - передаём их модели явно, иначе в шапке
+    # плана появляется «[уточнить по учебнику]».
+    context: List[str] = []
+    if book_name:
+        grade = book_class(book_name)
+        context.append(f"Предмет: {book_subject(book_name)}")
+        if grade:
+            context.append(f"Класс: {grade}")
+        context.append(f"Учебник: {book_label(book_name)}")
+    if para_num is not None:
+        context.append(f"Параграф: {para_num}")
+
     user_request = request
+    if context:
+        user_request = "Данные об уроке:\n" + "\n".join(context) + "\n\n" + user_request
+
     if paragraph:
         user_request += "\n\nТекст параграфа из учебника (строй план на нём):\n" + paragraph
         where = book_label(book_name) if book_name else "учебнике"
-        edit_message(chat_id, status, f"📖 Нашёл параграф в «{where}» ({len(paragraph)} символов)")
+        edit_message(chat_id, status, f"Нашёл параграф в «{where}» ({len(paragraph)} символов)")
     else:
-        edit_message(chat_id, status, "📖 Параграф в книгах не нашёл — составлю план без текста учебника.")
+        edit_message(chat_id, status, "Параграф в книгах не нашёл — составлю план без текста учебника.")
 
-    edit_message(chat_id, status, f"🤖 Генерирую план через {MODEL}, это займёт 1-2 минуты...")
+    edit_message(chat_id, status, f"Генерирую план через {MODEL}, это займёт 1-2 минуты...")
     answer = ask_model(user_request)
     if answer.startswith("Ошибка модели"):
         # План не получился - не надо сохранять текст ошибки в документ.
         log.warning(f"План не сгенерирован: {answer}")
-        edit_message(chat_id, status, f"❌ {answer}")
+        edit_message(chat_id, status, f"Ошибка: {answer}")
         return
 
     try:
         path = Path(tempfile.gettempdir()) / f"plan_{datetime.now():%Y%m%d_%H%M%S%f}.docx"
         make_docx(answer, str(path))
         send_doc(chat_id, str(path), "План-конспект урока")
-        edit_message(chat_id, status, "✅ Готово! План-конспект — в документе ниже.")
+        edit_message(chat_id, status, "Готово! План-конспект — в документе ниже.")
         try:
             path.unlink()
         except Exception:
@@ -1033,7 +1057,7 @@ def run_plan(chat_id: int, request: str, only_book: Optional[str] = None,
     except Exception as doc_ex:
         log.warning("DOCX error: " + str(doc_ex))
         send(chat_id, answer)
-        edit_message(chat_id, status, "✅ Готово! Ниже — план текстом.")
+        edit_message(chat_id, status, "Готово! Ниже — план текстом.")
 
 
 def handle_callback_query(cb: dict) -> None:
