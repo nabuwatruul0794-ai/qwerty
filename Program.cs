@@ -202,12 +202,13 @@ Dictionary<string, List<string>> LoadBooks()
         {
             var psi = new ProcessStartInfo
             {
-                FileName = Process.GetCurrentProcess().MainModule.FileName,
-                Arguments = $"--read-book \"{file}\"",
+                FileName = "dotnet",
+                Arguments = $"bottg.dll --read-book \"{file}\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                WorkingDirectory = AppContext.BaseDirectory
             };
             using var proc = Process.Start(psi)!;
             proc.WaitForExit();
