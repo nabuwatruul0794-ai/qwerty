@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
+import state_store
+
 import logging
 logging.basicConfig(
     level=logging.INFO,
@@ -1093,54 +1095,26 @@ def book_toc_text(book_name: str) -> str:
     return "\n".join(lines)
 
 
-# ---------- Состояние выбора книги ----------
-# Живёт в файле, а не в памяти: под gunicorn работает несколько воркеров
-# и выбранная книга должна быть видна тому воркеру, который примет следующее сообщение.
-STATE_PATH = Path(tempfile.gettempdir()) / "bottg_state.json"
-_state_lock = threading.Lock()
-
-
-def _load_state() -> Dict[str, dict]:
-    try:
-        if STATE_PATH.exists():
-            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return {str(k): (v if isinstance(v, dict) else {"book": str(v)})
-                        for k, v in data.items()}
-    except Exception as ex:
-        log.warning(f"Не удалось прочитать состояние: {ex}")
-    return {}
-
-
+# ---------- Состояние чата ----------
+# Живёт в SQLite, а не в памяти: под gunicorn работает несколько воркеров,
+# и выбранная книга (или последний план) должна быть видна тому воркеру,
+# который примет следующее сообщение. Через JSON-файл воркеры перетирали
+# друг друга при записи - теперь пишем транзакцией.
 def state_get(chat_id: int) -> Dict[str, object]:
     """Запись состояния чата: выбранная книга и последний план-конспект."""
-    with _state_lock:
-        rec = _load_state().get(str(chat_id))
-    return rec if isinstance(rec, dict) else {}
+    try:
+        return state_store.get(int(chat_id))
+    except Exception as ex:
+        log.warning(f"Не удалось прочитать состояние: {ex}")
+        return {}
 
 
 def state_set(chat_id: int, **fields) -> None:
     """Обновляет поля записи состояния; пустое значение удаляет поле."""
-    with _state_lock:
-        data = _load_state()
-        rec = data.get(str(chat_id))
-        if not isinstance(rec, dict):
-            rec = {}
-        for key, value in fields.items():
-            if value is None or value == "":
-                rec.pop(key, None)
-            else:
-                rec[key] = value
-        if rec:
-            data[str(chat_id)] = rec
-        else:
-            data.pop(str(chat_id), None)
-        try:
-            tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            os.replace(str(tmp), str(STATE_PATH))
-        except Exception as ex:
-            log.warning(f"Не удалось сохранить состояние: {ex}")
+    try:
+        state_store.set_fields(int(chat_id), **fields)
+    except Exception as ex:
+        log.warning(f"Не удалось сохранить состояние: {ex}")
 
 
 def send_doc(chat_id: int, path: str, caption: str):
