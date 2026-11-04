@@ -153,6 +153,42 @@ SYSTEM_PROMPT = r"""
 - Не используй данные об учениках.
 """
 
+PRES_PROMPT = r"""
+Ты методист, который готовит промпты для ИИ-ассистента Кими: Кими по такому промту
+сам создаёт готовую презентацию к уроку.
+
+На входе тебе дают план-конспект урока. Составь из него ПОДРОБНЫЙ ПРОМТ ДЛЯ КИМИ,
+готовый к копированию в чат Кими.
+
+Что взять из плана:
+- Только содержательную часть: тема урока, ключевые понятия и определения, законы и
+  формулы, примеры из учебника, задачи для класса, демонстрации и опыты, что ученики
+  должны записать в тетрадь.
+- НЕ включай методическую часть: организационный момент, ход урока по минутам,
+  рефлексию, критерии оценивания, литературу, инструкции по домашнему заданию -
+  это всё для учителя, Кими не нужно.
+- Ничего не выдумывай: бери только термины, формулы и факты из плана. Формулы
+  переноси в LaTeX внутри $...$ (индексы через _, дроби через \frac{}{}).
+
+Структура промта (пиши ровно так):
+1. Роль и задача Кими: «Ты - создатель учебных презентаций для урока <предмет>,
+   <класс> класс...» с указанием, что нужно сделать.
+2. Контекст урока: предмет, класс, тема, параграф, учебник.
+3. Требования к презентации: 10-12 слайдов, аудитория - ученики <класс> класса,
+   язык - русский, крупный шрифт, минимум текста, схемы вместо таблиц,
+   каждый слайд - одна мысль.
+4. Слайд за слайдом. Для каждого слайда укажи: заголовок; 2-4 коротких тезиса;
+   формулы в LaTeX (если есть); что вывести на экран (схема, рисунок, пример,
+   задача); заметки для учителя; вопрос классу или задание.
+5. Оформление и стиль: светлый фон, тёмный текст, единая схема, минимум анимации.
+6. Ограничения: не выдумывать факты и формулы, не добавлять слайды ради объёма,
+   не перегружать слайд текстом.
+7. Формат ответа Кими: markdown, слайды разделены заголовком «Слайд N».
+
+Пиши по-русски, обычным текстом, без символов Markdown (без **, #), списки через тире.
+Выведи только сам промт - без вступных фраз, без пояснений и без комментариев.
+"""
+
 # ---------- Книги ----------
 BOOKS: Dict[str, List[str]] = {}
 # Готовый текстовый индекс (books_index/*.txt.gz) - грузится мгновенно,
@@ -813,11 +849,14 @@ def _render_formula(latex: str, tmp_dir: Path, cache: Dict[str, Tuple[Path, floa
 
 def _fill_paragraph(p, line: str, bold: bool = False,
                     tmp_dir: Optional[Path] = None,
-                    cache: Optional[Dict[str, Tuple[Path, float]]] = None) -> None:
+                    cache: Optional[Dict[str, Tuple[Path, float]]] = None,
+                    formulas_as_text: bool = False) -> None:
     """Заполняет абзац текстом и формулами.
 
     Формулы рисуются картинкой: родные формулы Word (OMML) показывает только
     Word, а мобильные просмотрщики их не рисуют и просто вырезают.
+    formulas_as_text=True - оставить формулы текстом LaTeX (для промта,
+    который потом пойдёт в другого ИИ).
     """
     from docx.shared import Inches, Pt
 
@@ -839,7 +878,7 @@ def _fill_paragraph(p, line: str, bold: bool = False,
         add_text(line[pos:m.start()])
         latex = m.group(1) if m.group(1) is not None else m.group(2)
         img = None
-        if tmp_dir is not None and cache is not None:
+        if not formulas_as_text and tmp_dir is not None and cache is not None:
             img = _render_formula(latex, tmp_dir, cache)
         if img:
             path, width = img
@@ -847,14 +886,16 @@ def _fill_paragraph(p, line: str, bold: bool = False,
                 p.add_run().add_picture(str(path), width=Inches(width))
             except Exception as ex:
                 log.warning(f"Не удалось вставить формулу в документ: {ex}")
-                add_text(latex)
+                add_text(f"${latex}$")
+        elif formulas_as_text:
+            add_text(f"${latex}$")   # оставляем разделители - по ним ИИ понимает формулу
         else:
-            add_text(latex)     # не отрисовалась - оставляем LaTeX текстом
+            add_text(latex)
         pos = m.end()
     add_text(line[pos:])
 
 
-def make_docx(plan: str, path: str):
+def make_docx(plan: str, path: str, formulas_as_text: bool = False):
     from docx import Document
     from docx.shared import Pt
     doc = Document()
@@ -873,7 +914,7 @@ def make_docx(plan: str, path: str):
             line = "• " + line[2:]
         heading = is_heading(line)
         p = doc.add_paragraph()
-        _fill_paragraph(p, line, heading, tmp_dir, cache)
+        _fill_paragraph(p, line, heading, tmp_dir, cache, formulas_as_text)
         p.paragraph_format.space_after = Pt(6)
         if bullet:
             p.paragraph_format.left_indent = Pt(36)
@@ -1059,27 +1100,39 @@ STATE_PATH = Path(tempfile.gettempdir()) / "bottg_state.json"
 _state_lock = threading.Lock()
 
 
-def _load_state() -> Dict[str, str]:
+def _load_state() -> Dict[str, dict]:
     try:
         if STATE_PATH.exists():
             data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
+                return {str(k): (v if isinstance(v, dict) else {"book": str(v)})
+                        for k, v in data.items()}
     except Exception as ex:
         log.warning(f"Не удалось прочитать состояние: {ex}")
     return {}
 
 
-def state_get(chat_id: int) -> Optional[str]:
+def state_get(chat_id: int) -> Dict[str, object]:
+    """Запись состояния чата: выбранная книга и последний план-конспект."""
     with _state_lock:
-        return _load_state().get(str(chat_id))
+        rec = _load_state().get(str(chat_id))
+    return rec if isinstance(rec, dict) else {}
 
 
-def state_set(chat_id: int, book: Optional[str]) -> None:
+def state_set(chat_id: int, **fields) -> None:
+    """Обновляет поля записи состояния; пустое значение удаляет поле."""
     with _state_lock:
         data = _load_state()
-        if book:
-            data[str(chat_id)] = book
+        rec = data.get(str(chat_id))
+        if not isinstance(rec, dict):
+            rec = {}
+        for key, value in fields.items():
+            if value is None or value == "":
+                rec.pop(key, None)
+            else:
+                rec[key] = value
+        if rec:
+            data[str(chat_id)] = rec
         else:
             data.pop(str(chat_id), None)
         try:
@@ -1115,22 +1168,23 @@ def models_list() -> str:
     sb.append(f"\nСейчас выбрана: {MODEL}")
     return "\n".join(sb)
 
-def ask_model(user_request: str) -> str:
+def ask_model(user_request: str, system: Optional[str] = None) -> str:
     family = api_family(MODEL)
     if family == "google":
         return "Модели Gemini бот пока не поддерживает."
 
+    sys_prompt = system or SYSTEM_PROMPT
     if family == "anthropic":
         url = "https://opencode.ai/inference/anthropic/v1/messages"
-        body = {"model": MODEL, "max_tokens": 32000, "system": SYSTEM_PROMPT,
+        body = {"model": MODEL, "max_tokens": 32000, "system": sys_prompt,
                 "messages": [{"role": "user", "content": user_request}]}
     elif family == "responses":
         url = "https://opencode.ai/inference/openai/v1/responses"
-        body = {"model": MODEL, "instructions": SYSTEM_PROMPT, "input": user_request, "max_output_tokens": 16000}
+        body = {"model": MODEL, "instructions": sys_prompt, "input": user_request, "max_output_tokens": 16000}
     else:
         url = "https://opencode.ai/inference/openai/v1/chat/completions"
         body = {"model": MODEL, "max_tokens": 16000,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                "messages": [{"role": "system", "content": sys_prompt},
                              {"role": "user", "content": user_request}]}
 
     log.info(f"Запрос к модели {MODEL} ({family}), длина запроса {len(user_request)} символов")
@@ -1242,7 +1296,10 @@ def run_plan(chat_id: int, request: str, only_book: Optional[str] = None,
         path = Path(tempfile.gettempdir()) / f"plan_{datetime.now():%Y%m%d_%H%M%S%f}.docx"
         make_docx(answer, str(path))
         send_doc(chat_id, str(path), "План-конспект урока")
-        edit_message(chat_id, status, "Готово! План-конспект — в документе ниже.")
+        # Сохраняем текст плана - по нему потом собираем промт для презентации.
+        state_set(chat_id, plan=answer, at=int(datetime.now().timestamp()))
+        edit_message(chat_id, status, "Готово! План-конспект — в документе ниже.",
+                     reply_markup=PRES_KEYBOARD)
         try:
             path.unlink()
         except Exception:
@@ -1250,7 +1307,52 @@ def run_plan(chat_id: int, request: str, only_book: Optional[str] = None,
     except Exception as doc_ex:
         log.warning("DOCX error: " + str(doc_ex))
         send(chat_id, answer)
-        edit_message(chat_id, status, "Готово! Ниже — план текстом.")
+        state_set(chat_id, plan=answer, at=int(datetime.now().timestamp()))
+        edit_message(chat_id, status, "Готово! Ниже — план текстом.",
+                     reply_markup=PRES_KEYBOARD)
+
+
+PRES_KEYBOARD = {"inline_keyboard": [[{"text": "Промт для презентации",
+                                       "callback_data": "pr:"}]]}
+PRES_TTL = 2 * 60 * 60      # план хранится 2 часа
+
+
+def make_presentation_prompt(chat_id: int) -> None:
+    """Собирает промт для Кими по последнему плану-конспекту."""
+    rec = state_get(chat_id)
+    plan = str(rec.get("plan") or "")
+    at = int(rec.get("at") or 0)
+    if not plan:
+        send(chat_id, "Сначала сделайте план-конспект (кнопки с книгой и параграфом), "
+                      "тогда я соберу промт для презентации.")
+        return
+    if at and datetime.now().timestamp() - at > PRES_TTL:
+        send(chat_id, "План-конспект уже старый (больше двух часов). Сделайте новый — "
+                      "и я соберу промт для презентации.")
+        return
+
+    status = send(chat_id, "Готовлю промт для презентации...")
+    request = ("Составь промт для ИИ Кими, чтобы он сделал презентацию к этому уроку.\n\n"
+               "План-конспект урока:\n" + plan)
+    prompt = ask_model(request, system=PRES_PROMPT)
+    if prompt.startswith("Ошибка модели"):
+        log.warning(f"Промт для презентации не получен: {prompt}")
+        edit_message(chat_id, status, f"Ошибка: {prompt}")
+        return
+    try:
+        path = Path(tempfile.gettempdir()) / f"pres_{datetime.now():%Y%m%d_%H%M%S%f}.docx"
+        make_docx(prompt, str(path), formulas_as_text=True)
+        send_doc(chat_id, str(path), "Промт для Кими - презентация к уроку")
+        edit_message(chat_id, status, "Промт для презентации готов — файл ниже. "
+                                      "Вставьте его в Кими.")
+        try:
+            path.unlink()
+        except Exception:
+            pass
+    except Exception as doc_ex:
+        log.warning("DOCX error (промт): " + str(doc_ex))
+        send(chat_id, prompt)
+        edit_message(chat_id, status, "Готово! Ниже — промт текстом.")
 
 
 def handle_callback_query(cb: dict) -> None:
@@ -1276,7 +1378,7 @@ def handle_callback_query(cb: dict) -> None:
             if not name:
                 answer_cb(cb_id, "Книга не найдена")
                 return
-            state_set(chat_id, name)
+            state_set(chat_id, book=name)
             answer_cb(cb_id, book_label(name))
             edit_message(chat_id, mid, book_toc_text(name),
                          reply_markup=paragraph_keyboard(name, 0))
@@ -1311,8 +1413,11 @@ def handle_callback_query(cb: dict) -> None:
             answer_cb(cb_id)
             edit_message(chat_id, mid, book_toc_text(name),
                          reply_markup=paragraph_keyboard(name, page))
+        elif data.startswith("pr"):
+            answer_cb(cb_id, "Готовлю промт")
+            make_presentation_prompt(chat_id)
         elif data == "bkx":
-            state_set(chat_id, None)
+            state_set(chat_id, book=None, plan=None, at=None)
             answer_cb(cb_id, "Отменено")
             edit_message(chat_id, mid, "Выбор отменён.", reply_markup={"inline_keyboard": []})
         else:
@@ -1350,6 +1455,9 @@ def handle_update(update: dict):
                 reply_markup=books_keyboard(),
             )
             return
+        if text.startswith("/през") or text.startswith("/presentation"):
+            make_presentation_prompt(chat_id)
+            return
         if text.startswith("/books"):
             names = book_order()
             if not names:
@@ -1376,10 +1484,10 @@ def handle_update(update: dict):
             return
 
         # Книга, выбранная кнопкой, действует на один запрос.
-        selected = state_get(chat_id)
+        selected = str(state_get(chat_id).get("book") or "")
         if selected:
-            state_set(chat_id, None)
-        run_plan(chat_id, text, only_book=selected)
+            state_set(chat_id, book=None)
+        run_plan(chat_id, text, only_book=selected or None)
     except Exception as ex:
         log.warning("HandleUpdate error: " + str(ex))
 
