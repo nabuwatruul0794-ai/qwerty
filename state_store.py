@@ -16,7 +16,6 @@ JSON-файл не годится: два воркера перетирают д
 """
 import json
 import logging
-import os
 import sqlite3
 import tempfile
 import threading
@@ -92,6 +91,9 @@ def init() -> None:
                     "CREATE TABLE IF NOT EXISTS state ("
                     "chat_id INTEGER PRIMARY KEY, book TEXT, plan TEXT, "
                     "at INTEGER, updated INTEGER)")
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS settings ("
+                    "key TEXT PRIMARY KEY, value TEXT)")
             finally:
                 conn.close()
             _migrate_from_json()
@@ -165,6 +167,42 @@ def set_fields(chat_id: int, **fields) -> None:
                 (int(chat_id), rec["book"], rec["plan"], rec["at"], int(time.time())))
         else:
             conn.execute("DELETE FROM state WHERE chat_id = ?", (int(chat_id),))
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def get_setting(key: str) -> Optional[str]:
+    """Общая настройка (например выбранная модель) - общая для всех воркеров."""
+    init()
+    try:
+        conn = _connect()
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (str(key),)).fetchone()
+        finally:
+            conn.close()
+        return row["value"] if row else None
+    except Exception as ex:
+        log.warning("Не удалось прочитать настройку %s: %s", key, ex)
+        return None
+
+
+def set_setting(key: str, value: str) -> None:
+    """Сохраняет общую настройку."""
+    init()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(key), str(value)))
         conn.execute("COMMIT")
     except Exception:
         try:

@@ -5,8 +5,9 @@ import os
 import sys
 import re
 import json
+import math
 import gzip
-import subprocess
+import hmac
 import tempfile
 import threading
 import urllib.request
@@ -110,6 +111,14 @@ API_BASE = f"https://api.telegram.org/bot{TOKEN}/"
 # дефолтный User-Agent urllib - поэтому подставляем обычный браузерный.
 MODEL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+# Формулы в тексте плана: $...$ или $$...$$
+MATH_SPAN_RE = re.compile(r"\$\$([^$]+)\$\$|\$([^$]+)\$")
+
+# Секрет вебхука: без него любой может слать боту фальшивые обновления
+# и тратить ваш ключ модели. Telegram присылает его в заголовке
+# X-Telegram-Bot-Api-Secret-Token.
+WEBHOOK_SECRET = get_env("BOT_WEBHOOK_SECRET", "").strip()
 
 SYSTEM_PROMPT = r"""
 Ты помощник учителя физики, математики и информатики в Беларуси. Ты составляешь подробный план-конспект урока.
@@ -664,18 +673,29 @@ def paragraph_text(name: str, num: int) -> str:
     return ""
 
 def warmup_books() -> None:
+    """Индекс книг читается сразу (это быстро), PDF - только если индекса нет."""
     global BOOKS_INDEX, BOOKS_META
     try:
         index_dir = find_dir_up("books_index", BASE_DIR)
         if index_dir:
             BOOKS_INDEX, BOOKS_META = load_books_index(index_dir)
-        books_dir = find_dir_up("books", BASE_DIR)
-        if books_dir and not BOOKS_INDEX:
-            log.info("Индекс не найден - читаю PDF напрямую (на free-плане это очень медленно)")
-            BOOKS.update(load_books(books_dir))
-            log.info(f"Книг загружено из PDF: {len(BOOKS)}")
     except Exception as ex:
         log.error(f"warmup_books: {ex}")
+    if not BOOKS_INDEX:
+        # Индекса нет - читать PDF надо долго, поэтому в фоне.
+        threading.Thread(target=_load_pdfs_in_background, daemon=True).start()
+
+
+def _load_pdfs_in_background() -> None:
+    try:
+        books_dir = find_dir_up("books", BASE_DIR)
+        if not books_dir:
+            return
+        log.info("Индекс не найден - читаю PDF напрямую (на free-плане это очень медленно)")
+        BOOKS.update(load_books(books_dir))
+        log.info(f"Книг загружено из PDF: {len(BOOKS)}")
+    except Exception as ex:
+        log.error(f"Не удалось прочитать PDF: {ex}")
 
 # ---------- Чтение одной книги ----------
 def read_book_one(file: str) -> Optional[Dict]:
@@ -787,7 +807,6 @@ def find_paragraph(request: str, only_book: Optional[str] = None) -> Tuple[Optio
     if num == -1 and not stems:
         return (None, None)
 
-    import math
     best_text: Optional[str] = None
     best_book: Optional[str] = None
     best_score = 0
@@ -870,13 +889,8 @@ def _fill_paragraph(p, line: str, bold: bool = False,
         run.font.size = Pt(12)
         run.bold = bold
 
-    try:
-        import latex_omml
-    except Exception:
-        latex_omml = None
-
     pos = 0
-    for m in (latex_omml.MATH_SPAN_RE.finditer(line) if latex_omml else []):
+    for m in MATH_SPAN_RE.finditer(line):
         add_text(line[pos:m.start()])
         latex = m.group(1) if m.group(1) is not None else m.group(2)
         img = None
@@ -1400,8 +1414,21 @@ def handle_callback_query(cb: dict) -> None:
         log.warning(f"HandleCallbackQuery error: {ex}")
 
 
+def refresh_model() -> None:
+    """Подхватывает модель, выбранную в другой воркер (MODEL - глобальная переменная процесса)."""
+    global MODEL
+    try:
+        saved = state_store.get_setting("model")
+    except Exception:
+        return
+    if saved and saved in MODELS.values() and saved != MODEL:
+        MODEL = saved
+        log.info(f"Модель из общих настроек: {MODEL}")
+
+
 def handle_update(update: dict):
     try:
+        refresh_model()
         cb = update.get("callback_query")
         if cb:
             handle_callback_query(cb)
@@ -1452,6 +1479,10 @@ def handle_update(update: dict):
             arg = text[6:].strip()
             if arg in MODELS:
                 MODEL = MODELS[arg]
+                try:
+                    state_store.set_setting("model", MODEL)
+                except Exception as ex:
+                    log.warning(f"Не удалось сохранить выбор модели: {ex}")
                 send(chat_id, f"Модель переключена: {MODEL}")
             else:
                 send(chat_id, "Такой модели нет.\n\n" + models_list())
@@ -1464,6 +1495,13 @@ def handle_update(update: dict):
         run_plan(chat_id, text, only_book=selected or None)
     except Exception as ex:
         log.warning("HandleUpdate error: " + str(ex))
+        try:
+            chat_id = (update.get("message") or {}).get("chat", {}).get("id")
+            if chat_id:
+                send(chat_id, "Что-то пошло не так, разбираюсь. Попробуйте ещё раз или "
+                              "напишите /books.")
+        except Exception:
+            pass
 
 # ---------- Веб-сервер ----------
 from flask import Flask, request, jsonify
@@ -1480,6 +1518,11 @@ def health():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    if WEBHOOK_SECRET:
+        got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(got, WEBHOOK_SECRET):
+            log.warning("Вебхук с неверным секретом - запрос отклонён")
+            return jsonify({"status": "forbidden"}), 403
     update = request.get_json(force=True) or {}
     threading.Thread(target=handle_update, args=(update,), daemon=True).start()
     return jsonify({"status": "ok"})
@@ -1490,12 +1533,12 @@ def _is_read_book_cli() -> bool:
 
 
 def startup() -> None:
-    """Стартовые действия: фоновая загрузка книг и установка вебхука.
+    """Стартовые действия: загрузка книг и установка вебхука.
 
     Вызывается при импорте модуля, потому что gunicorn не выполняет блок
     __main__, а запускает приложение как WSGI-объект.
     """
-    threading.Thread(target=warmup_books, daemon=True).start()
+    warmup_books()          # индекс читается быстро - синхронно, чтобы книги были сразу
     log.info(f"Сервер стартует сразу, книги грузятся в фоне. Модель: {MODEL}")
 
     if not PUBLIC_URL:
@@ -1505,6 +1548,8 @@ def startup() -> None:
         webhook_url = f"{PUBLIC_URL}/webhook"
         log.info(f"Устанавливаю вебхук: {webhook_url}")
         url = f"{API_BASE}setWebhook?url={urllib.parse.quote(webhook_url)}"
+        if WEBHOOK_SECRET:
+            url += f"&secret_token={urllib.parse.quote(WEBHOOK_SECRET)}"
         with urllib.request.urlopen(url, timeout=30) as resp:
             log.info(f"setWebhook ответ: {resp.read().decode()}")
     except Exception as e:
