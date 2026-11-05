@@ -376,9 +376,19 @@ _MIN_TOC_RUN = 3       # столько плотных пунктов подря
 _MAX_HEADING_WORDS = 9
 
 
+_WS_RE = re.compile(r"[\s\u00a0\u2009]+")
+
+
 def _norm_ws(text: str) -> str:
-    """Пробелы, в том числе неразрывные и narrow, приводим к обычным."""
-    return re.sub(r"[\s\u00a0\u2009]+", " ", text).strip()
+    """Пробелы, в том числе неразрывные и narrow, приводим к обычным.
+
+    Быстрый путь: в большинстве строк обычные пробелы и ничего особенного -
+    тогда регулярка не нужна (она тут была главным узким местом разбора).
+    """
+    if ("\u00a0" not in text and "\u2009" not in text
+            and "\t" not in text and "  " not in text):
+        return text.strip()
+    return _WS_RE.sub(" ", text).strip()
 
 
 def _clean_title(text: str) -> str:
@@ -461,7 +471,9 @@ def _scan_headings(lines: List[str]) -> List[List[object]]:
 
 def _dot_leader_regions(lines: List[str], gap: int = 40, min_lines: int = 3) -> List[Tuple[int, int]]:
     """Границы блока содержания по точечным выноскам '.... 85'."""
-    hits = [i for i, l in enumerate(lines) if _DOT_LEADER.search(_norm_ws(l))]
+    # Регулярка сама терпит любые пробелы, поэтому нормализовать строки не нужно.
+    # Дешёвая проверка ".." отсекает больше 90% строк до регулярки.
+    hits = [i for i, l in enumerate(lines) if ".." in l and _DOT_LEADER.search(l)]
     regions: List[Tuple[int, int]] = []
     if not hits:
         return regions

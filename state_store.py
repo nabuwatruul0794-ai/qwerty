@@ -33,13 +33,37 @@ CLEAN_EVERY = 60          # секунд между чистками
 _init_lock = threading.Lock()
 _initialized = False
 _last_clean = 0.0
+_local = threading.local()
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=20, isolation_level=None)
+    """Соединение на поток: открывать базу на каждую операцию дорого (~3-7 мс)."""
+    path = str(DB_PATH)
+    conn = getattr(_local, "conn", None)
+    if conn is not None and getattr(_local, "path", None) == path:
+        return conn
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    conn = sqlite3.connect(path, timeout=20, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=20000")
+    _local.conn = conn
+    _local.path = path
     return conn
+
+
+def _close() -> None:
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _local.conn = None
+    _local.path = None
 
 
 def _migrate_from_json() -> None:
@@ -51,25 +75,22 @@ def _migrate_from_json() -> None:
         if not isinstance(data, dict):
             return
         conn = _connect()
-        try:
-            for key, value in data.items():
-                try:
-                    chat_id = int(key)
-                except (TypeError, ValueError):
-                    continue
-                book = value.get("book") if isinstance(value, dict) else str(value)
-                plan = value.get("plan") if isinstance(value, dict) else None
-                at = value.get("at") if isinstance(value, dict) else None
-                if not (book or plan):
-                    continue
-                conn.execute(
-                    "INSERT INTO state (chat_id, book, plan, at, updated) VALUES (?,?,?,?,?) "
-                    "ON CONFLICT(chat_id) DO UPDATE SET book=excluded.book, plan=excluded.plan, "
-                    "at=excluded.at, updated=excluded.updated",
-                    (chat_id, book, plan, at, int(time.time())))
-            log.info("Состояние перенесено из %s", OLD_JSON.name)
-        finally:
-            conn.close()
+        for key, value in data.items():
+            try:
+                chat_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            book = value.get("book") if isinstance(value, dict) else str(value)
+            plan = value.get("plan") if isinstance(value, dict) else None
+            at = value.get("at") if isinstance(value, dict) else None
+            if not (book or plan):
+                continue
+            conn.execute(
+                "INSERT INTO state (chat_id, book, plan, at, updated) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET book=excluded.book, plan=excluded.plan, "
+                "at=excluded.at, updated=excluded.updated",
+                (chat_id, book, plan, at, int(time.time())))
+        log.info("Состояние перенесено из %s", OLD_JSON.name)
         try:
             OLD_JSON.rename(OLD_JSON.with_suffix(".json.migrated"))
         except Exception:
@@ -85,17 +106,14 @@ def init() -> None:
             return
         try:
             conn = _connect()
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS state ("
-                    "chat_id INTEGER PRIMARY KEY, book TEXT, plan TEXT, "
-                    "at INTEGER, updated INTEGER)")
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS settings ("
-                    "key TEXT PRIMARY KEY, value TEXT)")
-            finally:
-                conn.close()
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS state ("
+                "chat_id INTEGER PRIMARY KEY, book TEXT, plan TEXT, "
+                "at INTEGER, updated INTEGER)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS settings ("
+                "key TEXT PRIMARY KEY, value TEXT)")
             _migrate_from_json()
             _initialized = True
         except Exception as ex:
@@ -114,10 +132,7 @@ def cleanup(ttl: int = TTL, force: bool = False) -> None:
     _last_clean = now
     try:
         conn = _connect()
-        try:
-            conn.execute("DELETE FROM state WHERE updated IS NOT NULL AND updated < ?", (int(now - ttl),))
-        finally:
-            conn.close()
+        conn.execute("DELETE FROM state WHERE updated IS NOT NULL AND updated < ?", (int(now - ttl),))
     except Exception as ex:
         log.warning("Не удалось почистить состояние: %s", ex)
 
@@ -128,11 +143,8 @@ def get(chat_id: int) -> Dict[str, object]:
     cleanup()
     try:
         conn = _connect()
-        try:
-            row = conn.execute(
-                "SELECT book, plan, at FROM state WHERE chat_id = ?", (int(chat_id),)).fetchone()
-        finally:
-            conn.close()
+        row = conn.execute(
+            "SELECT book, plan, at FROM state WHERE chat_id = ?", (int(chat_id),)).fetchone()
         if not row:
             return {}
         return {key: row[key] for key in ("book", "plan", "at") if row[key] is not None}
@@ -174,8 +186,6 @@ def set_fields(chat_id: int, **fields) -> None:
         except Exception:
             pass
         raise
-    finally:
-        conn.close()
 
 
 def get_setting(key: str) -> Optional[str]:
@@ -183,10 +193,7 @@ def get_setting(key: str) -> Optional[str]:
     init()
     try:
         conn = _connect()
-        try:
-            row = conn.execute("SELECT value FROM settings WHERE key = ?", (str(key),)).fetchone()
-        finally:
-            conn.close()
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (str(key),)).fetchone()
         return row["value"] if row else None
     except Exception as ex:
         log.warning("Не удалось прочитать настройку %s: %s", key, ex)
@@ -210,8 +217,6 @@ def set_setting(key: str, value: str) -> None:
         except Exception:
             pass
         raise
-    finally:
-        conn.close()
 
 
 def stats() -> Dict[str, int]:
@@ -221,5 +226,6 @@ def stats() -> Dict[str, int]:
     try:
         row = conn.execute("SELECT COUNT(*) AS n, COUNT(plan) AS p FROM state").fetchone()
         return {"всего": int(row["n"]), "с планом": int(row["p"])}
-    finally:
-        conn.close()
+    except Exception as ex:
+        log.warning("Не удалось получить статистику: %s", ex)
+        return {}
