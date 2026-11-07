@@ -32,7 +32,7 @@ from pypdf import PdfReader
 def load_env_dict(path: Path) -> Dict[str, str]:
     d: Dict[str, str] = {}
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
             t = line.strip()
             if not t or t.startswith("#"):
                 continue
@@ -369,6 +369,9 @@ _PREP_END = re.compile(
     re.IGNORECASE)
 _LETTERS3 = re.compile(r"[A-Za-zА-Яа-яЁё]{3,}")
 _DOT_LEADER = re.compile(r"(?:\.\s*){3,}")   # выноски в содержании: ". . ." или "...."
+# Подпункт содержания: "1.1.", "17.2." - в названии параграфа его быть не должно.
+_SUBSEC_INLINE = re.compile(r"(?<![\d])\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?")
+_SUBSEC_LINE = re.compile(r"^\d{1,2}\s*\.\s*\d{1,2}\s*\.?\s")
 _PLAIN_RE = re.compile(r"^(\d{1,2})\s*\.?\s+(.*)$")
 _PLAIN_EMPTY_RE = re.compile(r"^(\d{1,2})\s*\.\s*$")
 _TOC_GAP = 20          # строк между соседними пунктами содержания
@@ -391,7 +394,23 @@ def _norm_ws(text: str) -> str:
     return _WS_RE.sub(" ", text).strip()
 
 
+def _cut_title(text: str) -> str:
+    """Оставляет в строке только название параграфа.
+
+    В содержании после названия идёт подпункт, выноски и номер страницы:
+        "§ 1. Современные компьютерные устройства 1.1. Различные виды ... — 1.2."
+    Название параграфа - только "Современные компьютерные устройства",
+    остальное отбрасываем.
+    """
+    out = _DOT_LEADER.split(text)[0]       # выноски "...." и всё, что после них
+    m = _SUBSEC_INLINE.search(out)
+    if m:
+        out = out[:m.start()]               # обрываем на первом подпункте
+    return re.sub(r"[\s.·—–-]+$", "", out).strip()
+
+
 def _clean_title(text: str) -> str:
+    text = _cut_title(text)
     text = re.sub(r"[\s.·]{2,}\s*\d{1,4}\s*$", "", text)
     return _norm_ws(text).strip(" .·")
 
@@ -563,7 +582,7 @@ def _toc_title(lines: List[str], idx: int, first: str) -> str:
     """
     frags: List[str] = []
     if first.strip():
-        frags.append(first.strip())
+        frags.append(_cut_title(first.strip()))
     j = idx + 1
     while j < len(lines) and j < idx + 14:
         s = _norm_ws(lines[j])
@@ -573,14 +592,20 @@ def _toc_title(lines: List[str], idx: int, first: str) -> str:
             break
         if re.fullmatch(r"\d{1,4}", s):
             break                      # отдельная строка с номером страницы
+        if _SUBSEC_LINE.match(s):
+            break                      # начало подпункта содержания
         if _PLAIN_RE.match(s) and _LETTERS3.search(s):
             break                      # начало следующего пункта содержания
         if len(s) > 70 or s.lower().startswith("рис"):
             break                      # это уже текст тела, а не название
+        if _DOT_LEADER.search(s):
+            frags.append(_cut_title(s))  # название закончилось выноской
+            break
         frags.append(s)
         j += 1
 
     out = _join_fragments(frags)
+    out = _cut_title(out)
     out = re.sub(r"[\s.·]*\d{1,4}\s*$", "", out)     # номер страницы
     out = re.sub(r"[\s.·.]+$", "", out)                 # хвостовые точки
     return _fix_split_word(re.sub(r"\s{2,}", " ", out).strip(" .·"))
@@ -681,7 +706,7 @@ def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
                 break
             m = _PLAIN_RE.match(s)
             if m and int(m.group(1)) == num:
-                rest = m.group(2)
+                rest = _cut_title(m.group(2))
                 if key and key in s.lower():
                     paras[num] = {"num": num, "start": i, "title": title or rest}
                     break
