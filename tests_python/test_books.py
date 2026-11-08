@@ -16,7 +16,14 @@ BOT_SCRIPT = ROOT / "bottg.py"
 
 
 # ---------- helpers ----------
-def read_book_direct(file: str) -> list[str]:
+# Разбор PDF - самая медленная часть набора: без кэша один и тот же файл
+# читается несколько раз (содержимое, прямое/подпроцессное сравнение,
+# замер памяти). Кэш ускоряет прогон, ничего не меняя по смыслу.
+from functools import lru_cache
+
+
+@lru_cache(maxsize=None)
+def read_book_direct(file: str) -> tuple[str, ...]:
     reader = PdfReader(file)
     lines: list[str] = []
     for page in reader.pages:
@@ -25,10 +32,11 @@ def read_book_direct(file: str) -> list[str]:
             t = l.strip()
             if t:
                 lines.append(t)
-    return lines
+    return tuple(lines)
 
 
-def read_book_subprocess(file: str) -> list[str]:
+@lru_cache(maxsize=None)
+def read_book_subprocess(file: str) -> tuple[str, ...]:
     # Кодировка UTF-8 задаётся явно с обеих сторон: в тексте учебников есть
     # символы (U+2212 «−», U+2032 «′»), которые локальная кодовая страница
     # cp1251 не умеет кодировать, и subprocess падает на print().
@@ -42,8 +50,8 @@ def read_book_subprocess(file: str) -> list[str]:
         print(psi.stderr.strip())
     data = json.loads(psi.stdout.strip())
     if data is None:
-        return []
-    return [s for s in data["lines"] if s]
+        return ()
+    return tuple(s for s in data["lines"] if s)
 
 
 def get_book_files() -> list[str]:
@@ -149,6 +157,7 @@ def test_memory_usage_under_control():
     import gc
     files = get_book_files()
     import tracemalloc
+    read_book_direct.cache_clear()      # меряем реальное чтение, а не кэш
     tracemalloc.start()
     for f in files:
         read_book_direct(f)
