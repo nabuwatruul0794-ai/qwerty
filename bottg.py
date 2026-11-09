@@ -13,7 +13,7 @@ import threading
 import urllib.request
 import urllib.parse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from datetime import datetime
 
 import state_store
@@ -131,8 +131,10 @@ SYSTEM_PROMPT = r"""
 ШАПКА - иди сразу с этих строк, без заголовков и без нумерации, каждая строка с новой:
 Учебный предмет: ...
 Класс: ...
-Тема раздела: ... (глава учебника, к которой относится параграф)
-Тема урока: ...
+Тема раздела: ... (раздел учебника, к которому относится параграф. Если в запросе есть
+   строка «Раздел (глава) учебника» - бери её оттуда дословно, не выдумывай свой раздел.)
+Тема урока: ... (название параграфа. Если в запросе есть строка «Название параграфа» -
+   бери её оттуда дословно. Тему урока не расширяй и не подменяй.)
 Цели урока:
 - Образовательные: ...
 - Развивающие: ...
@@ -158,11 +160,12 @@ SYSTEM_PROMPT = r"""
    1) Организационный момент (2 мин)
    2) Актуализация знаний (5 мин). Вопросы для фронтальной беседы OBЯЗАТЕЛЬНО должны содержать
       краткие правильные ответы в скобках после каждого вопроса (для самопроверки учителя).
-   3) Мотивация и постановка проблемы (3 мин): демонстрация или проблемный вопрос. ТЫ ОБЯЗАН
-      привести не просто ответ, а подробное физическое/логическое объяснение этой проблемы,
-      чтобы учитель мог озвучить его классу.
+   3) Мотивация и постановка проблемы (3 мин): демонстрация или проблемный вопрос по материалу
+      этого же параграфа. ТЫ ОБЯЗАН привести не просто ответ, а подробное физическое/логическое
+      объяснение этой проблемы, чтобы учитель мог озвучить его классу.
    4) Изучение нового материала (18 мин) по подпунктам 4.1, 4.2 и так далее, с минутами,
-      с записью в тетрадь, опытами, формулами и определениями.
+      с записью в тетрадь, опытами, формулами и определениями. Содержание подпунктов и их
+      порядок бери из текста параграфа.
    5) Формирование умений и навыков (12 мин): сначала утверждения «верно или неверно» с ответами
       (по 3-4 утверждения), потом практическая задача или упражнение. Если приводится практическая
       задача, ТЫ ОБЯЗАН расписать ее ПОЛНОЕ И ПОДРОБНОЕ РЕШЕНИЕ: краткое условие (Дано / Найти),
@@ -170,9 +173,10 @@ SYSTEM_PROMPT = r"""
       численный ответ. Укажи критерии оценивания работы.
    6) Подведение итогов (2 мин): что изучили, что было непонятно, главные выводы для записи
       в тетрадь; вопросы с ответами в скобках.
-   7) Домашнее задание (3 мин): номера параграфов, вопросов или задач. Если учителю предлагается
-      задать на дом задачи, ТЫ ОБЯЗАН прямо в конспекте расписать их полное пошаговое решение
-      и ответы, чтобы учителю не пришлось считать самостоятельно при проверке.
+   7) Домашнее задание (3 мин): номера параграфов, вопросов или задач - только те, что названы
+      в тексте параграфа. Если учителю предлагается задать на дом задачи, ТЫ ОБЯЗАН прямо в
+      конспекте расписать их полное пошаговое решение и ответы, чтобы учителю не пришлось
+      считать самостоятельно при проверке.
 
 Как писать ход урока:
 - Текст каждого этапа - от лица учителя, сначала его действие, затем действия учеников:
@@ -181,10 +185,11 @@ SYSTEM_PROMPT = r"""
   «Учащиеся записывают в тетрадях дату и тему урока.»,
   «Учитель демонстрирует через проектор...», «Учитель предлагает учащимся ознакомиться со справкой...»,
   «Учитель объясняет порядок выполнения заданий и озвучивает критерии их оценивания.»
-- ПРОГНОЗНЫЙ ВОПРОС - главный приём живости урока: перед каждым опытом спрашивай заранее
-  «Как вы думаете, что произойдёт, если...?», «Что будет, если...?». Учитель записывает
-  предположения класса на доске, потом проверяет опытом и делает вывод. Прогноз обязателен
-  хотя бы перед одним опытом урока.
+- ПРОГНОЗНЫЙ ВОПРОС - главный приём живости урока: перед каждым опытом, который ЕСТЬ в
+  тексте параграфа, спрашивай заранее «Как вы думаете, что произойдёт, если...?»,
+  «Что будет, если...?». Учитель записывает предположения класса на доске, потом проверяет
+  опытом и делает вывод. Прогноз обязателен хотя бы перед одним опытом урока.
+  Если в тексте опытов нет - не придумывай опыт, а сделай прогноз перед задачей.
 - Чередуй виды работы: опыт - обсуждение - запись в тетрадь. Не держи один вид деятельности
   дольше 6 минут подряд.
 - Вопросы пиши нумерованным перечнем 1., 2., 3. - и сразу после вопроса ответ в скобках.
@@ -192,6 +197,27 @@ SYSTEM_PROMPT = r"""
 - В конце хода урока - короткая похвала учителя классу («Молодцы, ребята! Вы сегодня очень хорошо поработали!»).
 - Не пиши служебные надписи вроде «Начало», «Содержание», «Страница N из 80», «Назад», «На весь экран»,
   «Закрыть» - это мусор из электронного учебника, в конспект его тащить не надо.
+
+ИСТОЧНИК ФАКТОВ - ГЛАВНОЕ ПРАВИЛО.
+Текст параграфа, который дан в запросе, - единственный источник содержания урока.
+План пишется ТОЛЬКО по нему.
+- Определения, формулы, обозначения, единицы измерения, числовые значения и выводы бери
+  ТОЛЬКО из текста параграфа. Ничего не подставляй из других параграфов, глав и разделов.
+- Иди по структуре параграфа: сначала его подпункты (1.1, 2.2, ...) в том же порядке,
+  потом задачи, опыты и вопросы, которые есть в тексте, с их реальными номерами.
+- Задачи, опыты, примеры, вопросы и упражнения - только те, что есть в тексте, с их
+  номерами. Новые задачи не придумывай: допускается одна тренировочная задача на этапе 5,
+  и только с полным разобранным решением.
+- Рубрики учебника («Контрольные вопросы», «Задачи», «Примеры», «Работа в паре»,
+  «Проверь себя») переноси в конспект с их названиями - по ним учитель видит структуру
+  параграфа и понимает, что брать в класс.
+- Если в тексте нет того, что нужно для шапки или этапа (оборудование, литература,
+  номер упражнения, иллюстрация), пиши честно «[в учебнике не указано]».
+  НИКОГДА не выдумывай номер параграфа, страницы, рисунка, упражнения, формулу или факт.
+- Не добавляй в конспент тем, которых нет в параграфе: «дополнительно», «из опыта»,
+  «для повторения», «из предыдущего параграфа», «как мы уже знали».
+- Перед тем как закончить, мысленно проверь каждый факт конспекта: он есть в тексте
+  параграфа? Если нет - убери его или замени на «[в учебнике не указано]».
 
 Правила:
 - Все формулы, величины и обозначения записывай в LaTeX внутри $...$:
@@ -205,8 +231,7 @@ SYSTEM_PROMPT = r"""
 - К абсолютно любой sгенерированной задаче, проблемному вопросу или практическому заданию на любом этапе урока ТЫ ОБЯЗАН предоставить ПОЛНОЕ ХОД РЕШЕНИЯ с формулами, промежуточными расчетами и финальным ответом. Не ограничивайся только кратким ответом.
 - Если в запросе приведён текст параграфа учебника, строй план строго на нём: используй его определения, примеры, опыты, контрольные вопросы и упражнения.
 - Не выдумывай номера страниц, рисунков, контрольных вопросов и упражнений учебника. Если нужных данных нет, pиши «[уточнить по учебнику]».
-- Актуализация знаний только по уже изученному материалу, не по темам, которые идут позже.
-- Если ответ на задачу зависит от рисунка, добавь пометку «сверьте с рисунком в вашем экземпляре учебника».
+- Актуализация знаний только по уже изученному материалу, не по темам, которые идут позже.- Если ответ на задачу зависит от рисунка, добавь пометку «сверьте с рисунком в вашем экземпляре учебника».
 - Физические факты должны быть точными. Если не уверен, пометь это для учителя.
 - Не используй данные об учениках.
 """
@@ -386,6 +411,7 @@ def _norm_ws(text: str) -> str:
     тогда регулярка не нужна (она тут была главным узким местом разбора).
     """
     if ("\u00a0" not in text and "\u2009" not in text
+            and "\u2002" not in text and "\u2003" not in text
             and "\t" not in text and "  " not in text):
         return text.strip()
     return _WS_RE.sub(" ", text).strip()
@@ -494,6 +520,10 @@ def _dot_leader_regions(lines: List[str], gap: int = 40, min_lines: int = 3) -> 
 
 
 _TOC_CHAPTER = re.compile(r"^(Глава|ГЛАВА|Раздел|РАЗДЕЛ)\b")
+_ROMAN_NUM = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6,
+               "VII": 7, "VIII": 8, "IX": 9, "X": 10, "XI": 11, "XII": 12}
+_CHAPTER_HEAD_RE = re.compile(
+    r"^(?:глава|раздел|г\s*л\s*а\s*в\s*а|р\s*а\s*з\s*д\s*е\s*л)\b", re.IGNORECASE)
 _FOOTER = re.compile(r"^(Правообладатель|Минск\s)")
 
 
@@ -610,6 +640,401 @@ def _toc_regions(lines: List[str], occ: List[List[object]]) -> Tuple[List[bool],
     return toc_flag, regions
 
 
+# ---------- Колонтитулы: мусор, который остаётся после извлечения текста из PDF ----------
+# Из каждой страницы PDF- extractor отдаёт примерно так:
+#     [текст страницы] [подвал с копирайтом] [номер страницы] [бегущий заголовок]
+# Бегущий заголовок последней страницы параграфа - это уже НАЗВАНИЕ СЛЕДУЮЩЕГО
+# параграфа. Если его не убрать, модель строит часть урока по следующему параграфу.
+_FOOTER_COPY = re.compile(r"^(правообладатель|минск\s|©)", re.IGNORECASE)
+_CHAPTER_COMPACT = re.compile(r"^(глава|раздел)(?:\d|[IVXLC])", re.IGNORECASE)
+_PAGE_GLUE = re.compile(r"^\d{1,3}\s*[А-ЯЁA-Z]")   # "159Тригонометрия" - номер и заголовок
+_PAGE_NUM = re.compile(r"^\d{1,3}$")
+_SEC_ONLY = re.compile(r"^[§\s]+$")
+_FURNITURE_ZONE = 6        # насколько далеко от подвала искать колонтитулы
+_TITLE_MIN_KEY = 8         # минимальная длина ключа названия
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"\s+", "", text).lower()
+
+
+def _is_title_like(text: str) -> bool:
+    """Похоже на заголовок, а не на строку текста."""
+    if not text or len(text) > 60:
+        return False
+    words = text.split()
+    if not words or len(words) > 9:
+        return False
+    if not text[0].isalpha() or not text[0].isupper():
+        return False
+    if text.endswith((":", ";", ",")):
+        return False
+    return True
+
+
+def _is_caps_head(text: str) -> bool:
+    """Заголовок, напечатанный капителью - так печатают бегущие заголовки.
+
+    Считаем заглавные и строчные через длину строки: lower()/upper() работают
+    на уровне C, а посимвольный цикл по Python слишком медленный.
+    """
+    if len(text) < 10:
+        return False
+    up = len(text) - len(text.lower())
+    low = len(text) - len(text.upper())
+    if up + low < 6:
+        return False
+    return up / (up + low) >= 0.85
+
+
+def _title_match_set(titles: Iterable[str]) -> Tuple[Set[str], Set[str]]:
+    """Ключи названий параграфов: точное название и его префиксы.
+
+    Ключ - это название без пробелов и знаков ("Корень n-й степени из числа" ->
+    "кореньnйстепениизчисла"). Так ключ переживает разрыв названия на
+    несколько строк: PDF- extractor часто рвёт бегущий заголовок пополам.
+    Префиксы нужны, потому что бегущий заголовок - это название параграфа
+    без «хвоста» (формулы, условия).
+    """
+    exact: Set[str] = set()
+    prefixes: Set[str] = set()
+    for raw in titles:
+        key = _letters_key(str(raw))
+        if len(key) < 4:
+            continue
+        exact.add(key)
+        for k in range(_TITLE_MIN_KEY, len(key)):
+            prefixes.add(key[:k])
+    return exact, prefixes
+
+
+_NONWORD_RE = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def _letters_key(text: str) -> str:
+    """Название без пробелов и знаков: только буквы и цифры."""
+    return _NONWORD_RE.sub("", text.lower())
+
+
+def _is_known_title(text: str, exact: Set[str], prefixes: Set[str]) -> bool:
+    """Строка - это название параграфа (или его часть)?"""
+    return _is_known_title_key(_letters_key(text), exact, prefixes)
+
+
+def _is_known_title_key(key: str, exact: Set[str], prefixes: Set[str]) -> bool:
+    """То же, но по готовому ключу (без пробелов и знаков)."""
+    if len(key) < 4:
+        return False
+    if key in exact or key in prefixes:
+        return True
+    # строка длиннее названия: "Средняя и мгновенная скорость§ 8."
+    for k in range(_TITLE_MIN_KEY, min(len(key), 46)):
+        if key[:k] in exact:
+            return True
+    return False
+
+
+def _clean_furniture(chunk: List[str], norms: List[str], exact: Set[str], prefixes: Set[str],
+                     freq: Dict[str, int], next_title: str = "") -> List[str]:
+    """Убирает колонтитулы из текста параграфа.
+
+    Подвал, номер страницы и бегущий заголовок - не содержание параграфа.
+    Особенно важен хвост: там бегущий заголовок = название следующего параграфа,
+    и без чистки модель строит часть урока по следующему параграфу.
+    """
+    if len(chunk) <= 1:
+        return chunk
+    n = len(chunk)
+    drop = [False] * n
+
+    # 1. подвал с копирайтом - мусор в любом месте страницы
+    footers: List[int] = []
+    for i, t in enumerate(norms):
+        if _FOOTER_COPY.match(t):
+            drop[i] = True
+            footers.append(i)
+
+    # 2. зона разрыва страницы: всё, что стоит рядом с подвалом
+    zone = [False] * n
+    for a in footers:
+        for j in range(max(0, a - _FURNITURE_ZONE), min(n, a + _FURNITURE_ZONE + 1)):
+            zone[j] = True
+
+    # 3. внутри зоны разрыва убираем остальные колонтитулы
+    keycache: Dict[int, str] = {}
+
+    def key(i: int) -> str:
+        k = keycache.get(i)
+        if k is None:
+            k = _letters_key(norms[i])
+            keycache[i] = k
+        return k
+
+    for i in range(n):
+        if drop[i] or not zone[i]:
+            continue
+        t = norms[i]
+        if not t:
+            drop[i] = True
+        elif _PAGE_NUM.match(t) or _SEC_ONLY.match(t):
+            drop[i] = True                       # номер страницы
+        elif t[0] in "ГгРр" and _CHAPTER_COMPACT.match(_compact(t)):
+            drop[i] = True                       # "Гл а в а 2", "Глава IV"
+        elif _PAGE_GLUE.match(t):
+            drop[i] = True                       # "159Тригонометрия"
+        elif _is_known_title_key(key(i), exact, prefixes):
+            drop[i] = True                       # название параграфа в колонтитуле
+        elif _is_caps_head(t):
+            drop[i] = True                       # "КОРЕНЬ n-й СТЕПЕНИ ИЗ ЧИСЛА"
+        elif len(t) <= 60 and t[0].isupper() and freq.get(t.lower(), 0) >= 2 \
+                and _is_title_like(t):
+            drop[i] = True                       # повторяющийся бегущий заголовок
+
+    # 4. название параграфа, разбитое на несколько строк
+    _mark_title_blocks(norms, drop, zone, exact, prefixes, key)
+
+    # 5. хвост параграфа: бегущий заголовок следующей страницы = название
+    #    следующего параграфа. Убираем его, даже если он разбит на строки.
+    if next_title:
+        _mark_next_title(norms, drop, next_title, exact, prefixes)
+    # 6. после последнего подвала идёт шапка следующей страницы - её тоже убираем
+    if footers:
+        last = footers[-1]
+        for i in range(last + 1, n):
+            if drop[i]:
+                continue
+            t = norms[i]
+            if not t:
+                drop[i] = True
+                continue
+            if _is_title_like(t) and (freq.get(t.lower(), 0) >= 2
+                                      or _is_known_title(t, exact, prefixes)):
+                drop[i] = True
+                continue
+            break
+
+    # 7. первая строка - это сам заголовок параграфа, его беречь
+    drop[0] = False
+    return [chunk[i] for i in range(n) if not drop[i]]
+
+
+def _mark_title_blocks(norms: List[str], drop: List[bool], zone: List[bool],
+                       exact: Set[str], prefixes: Set[str], key) -> None:
+    """Помечает названия параграфов, разбитые на несколько строк."""
+    n = len(norms)
+    if not any(zone):
+        return
+    for i in range(n):
+        if drop[i] or not zone[i]:
+            continue
+        # название начинается с заглавной буквы и не длиннее заголовка
+        t = norms[i]
+        if not t or not t[0].isupper() or len(t) > 60:
+            continue
+        acc = ""
+        for j in range(i, min(n, i + 6)):
+            acc += key(j)
+            if len(acc) < _TITLE_MIN_KEY:
+                continue
+            if len(acc) > 90:
+                break
+            if acc in exact or acc in prefixes:
+                for k in range(i, j + 1):
+                    drop[k] = True
+                break
+
+
+def _mark_next_title(norms: List[str], drop: List[bool], next_title: str,
+                     exact: Set[str], prefixes: Set[str]) -> None:
+    """Помечает в хвосте название следующего параграфа (может быть разбито)."""
+    n = len(norms)
+    key = _letters_key(next_title)
+    if len(key) < _TITLE_MIN_KEY:
+        return
+    lo = max(0, n - 40)
+    parts: List[str] = []
+    owner: List[int] = []
+    for i in range(lo, n):
+        k = _letters_key(norms[i])
+        if not k:
+            continue
+        parts.append(k)
+        owner.extend([i] * len(k))
+    text = "".join(parts)
+    if not text:
+        return
+    # ищем название в хвосте; ключ может быть короче полного названия
+    keys = {key}
+    for k in range(_TITLE_MIN_KEY, len(key)):
+        keys.add(key[:k])
+    marked = set()
+    for k in keys:
+        # Ищем с конца: бегущий заголовок стоит в самом конце параграфа,
+        # а такое же название может встречаться и в тексте.
+        pos = text.rfind(k)
+        if pos < 0:
+            continue
+        a = owner[pos]
+        b = owner[min(len(owner) - 1, pos + len(k) - 1)]
+        # Название в тексте - не колонтитул. Убираем только если это
+        # последние строки параграфа или сплошной блок заголовков.
+        if b < n - 3 and not all(_is_title_like(norms[q]) for q in range(a, b + 1)):
+            continue
+        for q in range(a, b + 1):
+            marked.add(q)
+    for q in marked:
+        drop[q] = True
+    # соседние колонтитулы рядом с найденным названием
+    if marked:
+        for q in range(min(marked), max(marked) + 1):
+            t = norms[q]
+            if not drop[q] and t and (_CHAPTER_COMPACT.match(_compact(t))
+                                      or _PAGE_NUM.match(t)
+                                      or _PAGE_GLUE.match(t)
+                                      or _is_caps_head(t)):
+                drop[q] = True
+
+
+def _chapter_parts(t: str) -> Tuple[str, str]:
+    """'Глава 3. Основы статики' -> ('3', 'Основы статики').
+
+    'Глава 118' -> ('118', ''): это номер главы и страницы, названия нет.
+    """
+    m = _CHAPTER_HEAD_RE.match(t)
+    if not m:
+        return ("", "")
+    rest = t[m.end():].strip()
+    if not rest:
+        return ("", "")
+    m2 = re.match(r"^([IVXLC]{1,5})(?![A-Za-zА-Яа-я])", rest)
+    if m2:
+        return (m2.group(1).upper(), rest[m2.end():].lstrip(". ").strip())
+    m3 = re.match(r"^(\d{1,4})", rest)
+    if m3:
+        digits = m3.group(1)
+        tail = rest[len(digits):]
+        title = re.sub(r"[\s.·]{2,}\s*\d{1,4}\s*$", "", tail).strip(" .·")
+        if not re.search(r"[A-Za-zА-Яа-я]", title):
+            title = ""              # 'Глава 118' - номера, а не название
+        return (digits, title)
+    return ("", "")
+
+
+def _resolve_chapter(digits: str, known: Set[int]) -> Optional[int]:
+    """'118' -> 1 (глава 1, страница 18), если известны главы 1..3."""
+    if not digits:
+        return None
+    for k in range(min(len(digits), 2), 0, -1):
+        cand = int(digits[:k])
+        rest = digits[k:]
+        if cand in known and (rest == "" or (len(rest) <= 3 and rest.isdigit())):
+            return cand
+    return None
+
+
+def _title_case(text: str) -> str:
+    """'ТРИГОНОМЕТРИЯ' -> 'Тригонометрия'. Слова не полностью заглавными не трогаем."""
+    out = []
+    for w in text.split(" "):
+        letters = [c for c in w if c.isalpha()]
+        if letters and all(c.isupper() for c in letters):
+            out.append(w[0].upper() + w[1:].lower())
+        else:
+            out.append(w)
+    return " ".join(out)
+
+
+def _chapter_map(lines: List[str], occ: List[List[object]], toc_flag: List[bool],
+                 para_starts: Dict[int, int], norms_all: List[str]) -> Dict[int, str]:
+    """Глава (раздел) для каждого параграфа: номер параграфа -> название главы.
+
+    Название главы нужно для шапки плана - без него модель выдумывает раздел.
+    Названия берём из содержания, номер главы - по ближайшему заголовку главы.
+    """
+    toc_starts: Dict[int, int] = {}
+    for t, o in enumerate(occ):
+        if toc_flag[t]:
+            toc_starts.setdefault(int(o[1]), int(o[0]))
+
+    # 1. заголовки глав: (индекс строки, номер главы строкой, название)
+    marks: List[Tuple[int, str, str]] = []
+    titles: Dict[int, str] = {}
+    seen: Set[int] = set()
+    for i, raw in enumerate(lines):
+        t = norms_all[i]
+        # быстрый отсев: заголовок главы начинается с «Глава»/«Раздел»
+        if "лава" not in t[:8].lower() and "аздел" not in t[:8].lower() \
+                and "л а в" not in t[:8].lower() and "з д е" not in t[:8].lower():
+            continue
+        if not _CHAPTER_HEAD_RE.match(t):
+            continue
+        digits, title = _chapter_parts(t)
+        if not digits and not title and i + 1 < len(lines):
+            # номер главы иногда стоит на следующей строке: 'Глава' + '3. Основы статики'
+            nx = _norm_ws(lines[i + 1])
+            m = re.match(r"^(\d{1,2})\s*[.\s]\s*(.+)$", nx)
+            if m:
+                digits = m.group(1)
+                title = m.group(2).strip()
+        if not digits:
+            continue
+        num = 0
+        if digits.isdigit():
+            num = int(digits)
+        elif digits.upper() in _ROMAN_NUM:
+            num = _ROMAN_NUM[digits.upper()]
+        # название главы может стоять на следующих строках: 'Гл а в а 1' +
+        # 'КВАДРАТНЫЕ КОРНИ И ИХ СВОЙСТВА.' - но только у первого заголовка главы,
+        # дальше идёт бегущий колонтитул, за ним обычный текст.
+        if not title and num and num not in seen and i + 1 < len(lines):
+            nxt = _norm_ws(lines[i + 1])
+            if nxt and not nxt.startswith("§") and not _PAGE_NUM.match(nxt) \
+                    and _is_title_like(nxt):
+                title = nxt.rstrip(" .")
+                if i + 2 < len(lines):
+                    nxt2 = _norm_ws(lines[i + 2])
+                    if nxt2 and not nxt2.startswith("§") \
+                            and not _PAGE_NUM.match(nxt2) and _is_title_like(nxt2):
+                        title = f"{title}. {nxt2.rstrip(' .')}"
+        marks.append((i, digits, title))
+        if title and num:
+            # мусорный хвост вида 'Логарифмическая функция100 Глава 3' - не название
+            if re.search(r"\d{1,4}\s+[А-ЯЁ][а-яё]+", title):
+                continue
+            title = _title_case(title)
+            old = titles.get(num)
+            if old is None or (old.isupper() and not title.isupper()):
+                titles[num] = title
+        if num:
+            seen.add(num)
+    known = set(titles)
+
+    # 2. идём по книге и запоминаем текущую главу
+    out: Dict[int, str] = {}
+    cur = 0
+    mi = 0
+    for i in range(len(lines)):
+        while mi < len(marks) and marks[mi][0] == i:
+            digits = marks[mi][1]
+            num = None
+            if digits.upper() in _ROMAN_NUM:
+                num = _ROMAN_NUM[digits.upper()]
+            elif digits.isdigit():
+                num = _resolve_chapter(digits, known)
+                if num is None and int(digits) in known:
+                    num = int(digits)
+            if num:
+                cur = num
+            mi += 1
+        pnum = toc_starts.get(i)
+        if pnum is None:
+            pnum = para_starts.get(i)
+        if pnum is not None and cur:
+            title = titles.get(cur, "")
+            if title and pnum not in out:
+                out[pnum] = title
+    return out
+
 def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
     """Список параграфов книги с их границами в тексте."""
     occ = _scan_headings(lines)
@@ -698,6 +1123,24 @@ def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
             p["title"] = toc_title
         else:
             p["title"] = body_title if body_title else toc_title
+
+    # Индексы для чистки колонтитулов: названия параграфов и частота строк.
+    exact_titles, title_prefixes = _title_match_set(str(p.get("title") or "") for p in starts)
+    # Нормализованные строки считаем один раз на всю книну.
+    norms_all = [_norm_ws(l) for l in lines]
+    # Частоту считаем только у коротких строк, которые могут быть заголовком:
+    # на всю книгу это заметно быстрее.
+    freq: Dict[str, int] = {}
+    for t in norms_all:
+        if not t or len(t) > 60 or not t[0].isupper():
+            continue
+        key = t.lower()
+        freq[key] = freq.get(key, 0) + 1
+
+    # Глава (раздел) каждого параграфа - для шапки плана.
+    para_starts = {int(p["start"]): int(p["num"]) for p in starts}
+    chapters = _chapter_map(lines, occ, toc_flag, para_starts, norms_all)
+
     for i, p in enumerate(starts):
         end = len(lines)
         for q in starts[i + 1:]:
@@ -705,7 +1148,15 @@ def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
                 end = int(q["start"])
                 break
         p["end"] = end
-        p["text"] = "\n".join(lines[int(p["start"]):end])
+        p["chapter"] = chapters.get(int(p["num"]), "")
+        chunk = lines[int(p["start"]):end]
+        # Из текста параграфа убираем колонтитулы: подвал, номер страницы и
+        # бегущий заголовок. Иначе в конце параграфа модель видит название
+        # СЛЕДУЮЩЕГО параграфа и строит часть урока по нему.
+        next_title = str(starts[i + 1].get("title") or "") if i + 1 < len(starts) else ""
+        p["text"] = "\n".join(_clean_furniture(
+            chunk, norms_all[int(p["start"]):end], exact_titles, title_prefixes,
+            freq, next_title))
     return starts
 
 
@@ -730,6 +1181,14 @@ def paragraph_text(name: str, num: int) -> str:
         if int(p["num"]) == num:
             return str(p["text"])
     return ""
+
+
+def paragraph_info(name: str, num: int) -> Optional[Dict[str, object]]:
+    """Данные параграфа: название, глава, текст."""
+    for p in book_paragraphs(name):
+        if int(p["num"]) == num:
+            return p
+    return None
 
 def warmup_books() -> None:
     """Индекс книг читается сразу (это быстро), PDF - только если индекса нет."""
@@ -1322,6 +1781,16 @@ def run_plan(chat_id: int, request: str, only_book: Optional[str] = None,
         context.append(f"Учебник: {book_label(book_name)}")
     if para_num is not None:
         context.append(f"Параграф: {para_num}")
+        # Название параграфа и его глава - из учебника, чтобы модель не выдумывала
+        # тему урока и раздел.
+        info = paragraph_info(book_name, para_num) if book_name else None
+        if info:
+            title = str(info.get("title") or "").strip()
+            chapter = str(info.get("chapter") or "").strip()
+            if title:
+                context.append(f"Название параграфа: {title}")
+            if chapter:
+                context.append(f"Раздел (глава) учебника: {chapter}")
 
     user_request = request
     if context:
