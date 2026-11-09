@@ -32,7 +32,7 @@ from pypdf import PdfReader
 def load_env_dict(path: Path) -> Dict[str, str]:
     d: Dict[str, str] = {}
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
             t = line.strip()
             if not t or t.startswith("#"):
                 continue
@@ -394,6 +394,9 @@ _PREP_END = re.compile(
     re.IGNORECASE)
 _LETTERS3 = re.compile(r"[A-Za-zА-Яа-яЁё]{3,}")
 _DOT_LEADER = re.compile(r"(?:\.\s*){3,}")   # выноски в содержании: ". . ." или "...."
+# Подпункт содержания: "1.1.", "17.2." - в названии параграфа его быть не должно.
+_SUBSEC_INLINE = re.compile(r"(?<![\d])\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?")
+_SUBSEC_LINE = re.compile(r"^\d{1,2}\s*\.\s*\d{1,2}\s*\.?\s")
 _PLAIN_RE = re.compile(r"^(\d{1,2})\s*\.?\s+(.*)$")
 _PLAIN_EMPTY_RE = re.compile(r"^(\d{1,2})\s*\.\s*$")
 _TOC_GAP = 20          # строк между соседними пунктами содержания
@@ -401,6 +404,8 @@ _MIN_TOC_RUN = 3       # столько плотных пунктов подря
 _MAX_HEADING_WORDS = 9
 
 
+_WORD_RE = re.compile(r"[\u0430-\u044f\u0451]+")
+_CORE_RE = re.compile(r"^([A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451]+)(.*)$")
 _WS_RE = re.compile(r"[\s\u00a0\u2009]+")
 
 
@@ -417,7 +422,222 @@ def _norm_ws(text: str) -> str:
     return _WS_RE.sub(" ", text).strip()
 
 
+def _cut_title(text: str) -> str:
+    """Оставляет в строке только название параграфа.
+
+    В содержании после названия идёт подпункт, выноски и номер страницы:
+        "§ 1. Современные компьютерные устройства 1.1. Различные виды ... — 1.2."
+    Название параграфа - только "Современные компьютерные устройства",
+    остальное отбрасываем.
+    """
+    out = _DOT_LEADER.split(text)[0]       # выноски "...." и всё, что после них
+    m = _SUBSEC_INLINE.search(out)
+    if m:
+        out = out[:m.start()]               # обрываем на первом подпункте
+    return re.sub(r"[\s.·—–-]+$", "", out).strip()
+
+
+def _title_key(text: str) -> str:
+    """Ключ для сравнения названий: только буквы, без пробелов и регистра.
+
+    Нужен, чтобы понять, что два названия - одно и то же, даже если в одном
+    из них слово разорвано пробелом: "из менения" и "изменения" - одно слово.
+    """
+    return re.sub(r"[^0-9A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451]+", "", text).lower()
+
+
+def _book_vocab(lines: List[str]) -> Tuple[Dict[str, int], Dict[Tuple[str, str], int],
+                                           set]:
+    """Словарь книги, частоты соседних пар и слова-осколки.
+
+    Нужны, чтобы отличить разорванное слово от двух отдельных:
+    "из" + "менения" - это "изменения", а "и" + "меры" - два слова.
+    Разорванное слово встречается в книге заметно чаще, чем та же пара
+    как два отдельных слова.
+
+    Осколок - слово, которое в книге всегда идёт перед продолжением
+    ("построе" + "ние" -> "построение"): склеивать в такое нельзя.
+    """
+    counts: Dict[str, int] = {}
+    pairs: Dict[Tuple[str, str], int] = {}
+    after: Dict[str, List[str]] = {}
+    for line in lines:
+        ws = _WORD_RE.findall(line.lower())
+        for w in ws:
+            counts[w] = counts.get(w, 0) + 1
+        for a, b in zip(ws, ws[1:]):
+            key = (a, b)
+            pairs[key] = pairs.get(key, 0) + 1
+        for i, w in enumerate(ws[:-1]):
+            after.setdefault(w, []).append(ws[i + 1])
+    frag: set = set()
+    for w, nxts in after.items():
+        total = counts.get(w, 0)
+        glued = sum(1 for t in nxts if w + t in counts)
+        if total and glued * 2 > total:
+            frag.add(w)
+    return counts, pairs, frag
+
+
+def _word_parts(text: str) -> Tuple[List[str], List[str]]:
+    """Слова текста и разделители между ними.
+
+    Разбор идёт по словам, а не по "чётным позициям" списка: при склейке
+    индексы не должны сбиваться, иначе следующая пара не проверяется.
+    """
+    words: List[str] = []
+    seps: List[str] = []
+    pending = ""
+    for t in re.findall(r"\s+|\S+", text):
+        if t.isspace():
+            pending = t
+        else:
+            if words:
+                seps.append(pending)
+            words.append(t)
+            pending = ""
+    return words, seps
+
+
+def _join_parts(words: List[str], seps: List[str]) -> str:
+    if not words:
+        return ""
+    out = words[0]
+    for i in range(1, len(words)):
+        out += seps[i - 1] + words[i]
+    return out
+
+
+def _fix_split_by_dict(text: str, counts: Dict[str, int],
+                       pairs: Dict[Tuple[str, str], int], frag: set) -> str:
+    """Склеивает разорванные слова, если результат есть в словаре книги.
+
+    В PDF слова часто разорваны пробелом посреди слова ("И нтерфейс",
+    "из менения", "За кон Джоуля"). Склеиваем пару только если:
+    1) склеенное слово встречается в книге и не является осколком,
+    2) встречается заметно чаще, чем эта же пара как два отдельных слова.
+    Так "и" + "меры" остаётся двумя словами, а "из" + "менения"
+    склеивается в "изменения".
+
+    Редкое продолжение ("то" + "нких" -> "тонких") склеиваем тоже: вторая
+    часть почти никогда не встречается отдельно.
+    """
+    words, seps = _word_parts(text)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(words) - 1):
+            a, b = words[i], words[i + 1]
+            ma = _CORE_RE.match(a)
+            mb = _CORE_RE.match(b)
+            if not ma or not mb:
+                continue
+            ca, cb = ma.group(1), mb.group(1)
+            if not ca or not cb or ma.group(2):
+                continue          # у первого слова хвост ("слово.") - конец фразы
+            if len(ca) > 12 or len(cb) < 1:
+                continue
+            la, lb = ca.lower(), cb.lower()
+            # Цепочка из трёх кусков: "Ди" + "на" + "мометр" -> "Динамометр"
+            if i + 2 < len(words) and not ma.group(2) and not mb.group(2):
+                mc = _CORE_RE.match(words[i + 2])
+                if mc:
+                    cc = mc.group(1).lower()
+                    merged3 = la + lb + cc
+                    if (len(merged3) >= 4 and merged3 in counts
+                            and merged3 not in frag
+                            and counts.get(la + lb, 0) <= 2
+                            and counts.get(cc, 0) <= 10
+                            and pairs.get((lb, cc), 0) == 0):
+                        words[i] = ca + cb + mc.group(1) + mc.group(2)
+                        del words[i + 1:i + 3]
+                        del seps[i:i + 2]
+                        changed = True
+                        break
+            merged = la + lb
+            if len(merged) < 3 or merged in frag:
+                continue
+            merged_n = counts.get(merged, 0)
+            pair_n = pairs.get((la, lb), 0)
+            if merged_n >= 3:
+                if pair_n * 3 > merged_n:
+                    continue      # пара встречается и как два слова
+            else:
+                if merged_n < 1 or pair_n:
+                    continue
+                if counts.get(lb, 0) > 3:
+                    continue      # вторая часть - обычное слово, а не осколок
+            words[i] = ca + cb + mb.group(2)
+            del words[i + 1]
+            del seps[i]
+            changed = True
+            break
+    return _join_parts(words, seps)
+
+
+def _split_glued_token(text: str, counts: Dict[str, int]) -> str:
+    """Разделяет слипшиеся слова: "видчисла" -> "вид числа".
+
+    В PDF два слова могут склеиться без пробела. Разделяем, только если
+    вариант разбиения единственный и обе части есть в словаре книги.
+    """
+    words, seps = _word_parts(text)
+    changed = True
+    while changed:
+        changed = False
+        for i, tok in enumerate(words):
+            m = _CORE_RE.match(tok)
+            if not m:
+                continue
+            core, tail = m.group(1), m.group(2)
+            low = core.lower()
+            if low in counts:
+                continue
+            cands = [k for k in range(2, len(low) - 1)
+                     if low[:k] in counts and low[k:] in counts]
+            if len(cands) != 1:
+                continue          # вариантов несколько - не гадаем
+            k = cands[0]
+            words[i] = core[:k]
+            words.insert(i + 1, core[k:] + tail)
+            seps.insert(i, " ")
+            changed = True
+            break
+    return _join_parts(words, seps)
+
+
+def _split_glued(text: str, counts: Dict[str, int]) -> str:
+    """Разделяет слипшиеся слова: "пересече" + "ниечисловых".
+
+    В PDF иногда пропадает пробел между словами, и получается
+    "пересечение числовых". Разделяем, если из второго слова можно
+    выделить продолжение первого и отдельное слово, и оба есть в книге.
+    """
+    words, seps = _word_parts(text)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(words) - 1):
+            a, b = words[i], words[i + 1]
+            if not a.isalpha() or not b.isalpha():
+                continue
+            la, lb = a.lower(), b.lower()
+            if la not in counts or lb in counts:
+                continue          # слипшееся слово само по себе не в книге
+            for cut in range(2, len(lb) - 1):
+                head, tail = lb[:cut], lb[cut:]
+                if la + head not in counts or tail not in counts:
+                    continue
+                words[i] = a + b[:cut]
+                words[i + 1] = b[cut:]
+                changed = True
+                break
+            if changed:
+                break
+    return _join_parts(words, seps)
+
 def _clean_title(text: str) -> str:
+    text = _cut_title(text)
     text = re.sub(r"[\s.·]{2,}\s*\d{1,4}\s*$", "", text)
     return _norm_ws(text).strip(" .·")
 
@@ -593,7 +813,7 @@ def _toc_title(lines: List[str], idx: int, first: str) -> str:
     """
     frags: List[str] = []
     if first.strip():
-        frags.append(first.strip())
+        frags.append(_cut_title(first.strip()))
     j = idx + 1
     while j < len(lines) and j < idx + 14:
         s = _norm_ws(lines[j])
@@ -603,14 +823,20 @@ def _toc_title(lines: List[str], idx: int, first: str) -> str:
             break
         if re.fullmatch(r"\d{1,4}", s):
             break                      # отдельная строка с номером страницы
+        if _SUBSEC_LINE.match(s):
+            break                      # начало подпункта содержания
         if _PLAIN_RE.match(s) and _LETTERS3.search(s):
             break                      # начало следующего пункта содержания
         if len(s) > 70 or s.lower().startswith("рис"):
             break                      # это уже текст тела, а не название
+        if _DOT_LEADER.search(s):
+            frags.append(_cut_title(s))  # название закончилось выноской
+            break
         frags.append(s)
         j += 1
 
     out = _join_fragments(frags)
+    out = _cut_title(out)
     out = re.sub(r"[\s.·]*\d{1,4}\s*$", "", out)     # номер страницы
     out = re.sub(r"[\s.·.]+$", "", out)                 # хвостовые точки
     return _fix_split_word(re.sub(r"\s{2,}", " ", out).strip(" .·"))
@@ -1106,12 +1332,13 @@ def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
                 break
             m = _PLAIN_RE.match(s)
             if m and int(m.group(1)) == num:
-                rest = m.group(2)
+                rest = _cut_title(m.group(2))
                 if key and key in s.lower():
                     paras[num] = {"num": num, "start": i, "title": title or rest}
                     break
 
     starts = sorted(paras.values(), key=lambda p: int(p["start"]))
+    counts, pairs, frag = _book_vocab(lines)
     # Название параграфа: из тела оно точнее, из содержания - полнее.
     # Если название из тела - лишь часть названия из содержания, берём полное.
     for p in starts:
@@ -1123,6 +1350,11 @@ def _parse_paragraphs(lines: List[str]) -> List[Dict[str, object]]:
             p["title"] = toc_title
         else:
             p["title"] = body_title if body_title else toc_title
+        # Слова, разорванные пробелом в PDF, склеиваем по словарю книги.
+        p["title"] = _fix_split_by_dict(p["title"], counts, pairs, frag)
+        p["title"] = _split_glued_token(p["title"], counts)
+        p["title"] = _fix_split_by_dict(p["title"], counts, pairs, frag)
+        p["title"] = _split_glued(p["title"], counts)
 
     # Индексы для чистки колонтитулов: названия параграфов и частота строк.
     exact_titles, title_prefixes = _title_match_set(str(p.get("title") or "") for p in starts)
