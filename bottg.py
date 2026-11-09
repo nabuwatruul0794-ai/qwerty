@@ -2270,6 +2270,7 @@ def handle_update(update: dict):
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+_STARTED_AT = datetime.now().isoformat(timespec="seconds")
 
 @app.route("/")
 def index():
@@ -2277,7 +2278,12 @@ def index():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    # Коммит и время старта процесса - видно, какая версия реально на сервере.
+    return jsonify({
+        "status": "ok",
+        "commit": os.environ.get("RENDER_GIT_COMMIT", "local"),
+        "started": _STARTED_AT,
+    })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
