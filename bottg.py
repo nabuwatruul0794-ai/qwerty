@@ -1039,7 +1039,17 @@ def _clean_furniture(chunk: List[str], norms: List[str], exact: Set[str], prefix
                 continue
             break
 
-    # 7. первая строка - это сам заголовок параграфа, его беречь
+    # 7. номер страницы в самом конце параграфа - перед заголовком следующего
+    for i in range(n - 1, max(n - 3, -1), -1):
+        t = norms[i]
+        if not t:
+            continue
+        if _PAGE_NUM.match(t):
+            drop[i] = True
+            continue
+        break
+
+    # 8. первая строка - это сам заголовок параграфа, его беречь
     drop[0] = False
     return [chunk[i] for i in range(n) if not drop[i]]
 
