@@ -1051,7 +1051,12 @@ def _clean_furniture(chunk: List[str], norms: List[str], exact: Set[str], prefix
 
     # 8. первая строка - это сам заголовок параграфа, его беречь
     drop[0] = False
-    return [chunk[i] for i in range(n) if not drop[i]]
+    out = [chunk[i] for i in range(n) if not drop[i]]
+    if out:
+        # В некоторых учебниках номер страницы прилипает к знаку «§»:
+        # "61§ 8. Анимация" - номер страницы в заголовке не нужен.
+        out[0] = re.sub(r"^\s*\d{1,3}\s*(?=§)", "", out[0])
+    return out
 
 
 def _mark_title_blocks(norms: List[str], drop: List[bool], zone: List[bool],
